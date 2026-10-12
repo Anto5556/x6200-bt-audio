@@ -116,9 +116,14 @@ Window {
 
     function moveFocus(delta) {
         var items = focusItems();
-        if (items.length === 0)
+        var n = items.length;
+        if (n === 0)
             return;
-        root.focus = Math.max(0, Math.min(items.length - 1, root.focus + delta));
+        // Wrap around rather than stopping at the ends.  CLOSE is drawn in the
+        // top bar, so it is the last stop in the ring: one "up" from the first
+        // item (the route switch) reaches it, which is how the front panel gets
+        // to CLOSE without walking the whole device list first.
+        root.focus = (((root.focus + delta) % n) + n) % n;
         var name = items[root.focus];
         if (name.indexOf("device:") === 0) {
             root.deviceFocus = parseInt(name.slice(7), 10) || 0;
