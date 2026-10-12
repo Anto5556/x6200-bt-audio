@@ -1,0 +1,249 @@
+#! /bin/sh
+# btaudio -- launch the "BT AUDIO" screen on the Xiegu X6200.
+#
+# The stock GUI owns the display through Qt EGLFS, which permits only one
+# full-screen client at a time.  Showing BT Audio therefore means parking
+# x6200_ui_v100 for the duration of the screen and putting it back afterwards,
+# exactly the way the firmware's own /usr/share/support/userapp swaps apps.
+#
+# The audio backend is deliberately left running when the screen closes: once a
+# headset is bridged, the radio keeps feeding it, so you can browse back to the
+# waterfall and still listen on Bluetooth.
+#
+# Usage:
+#   btaudio start            show the BT Audio screen (starts the backend too)
+#   btaudio stop             stop the backend and restore the stock screen
+#   btaudio status           report what is running
+#   btaudio daemon start|stop|status    manage the backend only
+#   btaudio calibrate        pick the screen rotation for this panel
+#   btaudio keymap           map the front-panel navigation buttons
+#   btaudio snapshot [FILE]  render the screen offscreen to a PNG (dev aid)
+
+source /etc/profile 2>/dev/null
+
+APP_DIR=/usr/app_qt/btaudio
+QML=$APP_DIR/BtAudio.qml
+BACKEND=$APP_DIR/btaudiod
+PIDFILE=/tmp/btaudiod.pid
+SNAP_MARKER=/tmp/btaudio.snapshot
+SCREEN_LOG=/tmp/btaudio-screen.log
+MONIT_INIT=/etc/init.d/S99-1-monit
+USERAPP=/usr/share/support/userapp
+UI_PROC=x6200_ui_v100
+
+MONIT_PARKED=0
+
+# Read KEY=VALUE from /etc/btaudio.conf (comments and blank lines ignored).
+cfg() {
+    [ -f /etc/btaudio.conf ] || return 1
+    sed -n "s/^[[:space:]]*$1[[:space:]]*=[[:space:]]*\([^#[:space:]]*\).*/\1/p" \
+        /etc/btaudio.conf | head -1
+}
+
+# --------------------------------------------------------------------------
+# Backend daemon
+# --------------------------------------------------------------------------
+daemon_pid() {
+    [ -f "$PIDFILE" ] || return 1
+    pid=$(cat "$PIDFILE" 2>/dev/null)
+    [ -n "$pid" ] || return 1
+    kill -0 "$pid" 2>/dev/null || return 1
+    echo "$pid"
+}
+
+daemon_start() {
+    if daemon_pid >/dev/null; then
+        echo "btaudiod already running (pid $(daemon_pid))"
+        return 0
+    fi
+    printf 'Starting the Bluetooth audio service: '
+    start-stop-daemon -S -q -b -x "$BACKEND"
+    sleep 1
+    if daemon_pid >/dev/null; then
+        echo "OK"
+    else
+        echo "FAILED (see /tmp/btaudio.log)"
+        return 1
+    fi
+}
+
+daemon_stop() {
+    pid=$(daemon_pid) || { echo "btaudiod not running"; return 0; }
+    printf 'Stopping the Bluetooth audio service: '
+    kill "$pid" 2>/dev/null
+    n=0
+    while [ $n -lt 20 ] && kill -0 "$pid" 2>/dev/null; do
+        sleep 0.2
+        n=$((n + 1))
+    done
+    kill -0 "$pid" 2>/dev/null && kill -9 "$pid" 2>/dev/null
+    rm -f "$PIDFILE"
+    echo "OK"
+}
+
+daemon_status() {
+    if pid=$(daemon_pid); then
+        echo "btaudiod running (pid $pid)"
+    else
+        echo "btaudiod stopped"
+        return 1
+    fi
+}
+
+# --------------------------------------------------------------------------
+# Screen swap
+# --------------------------------------------------------------------------
+ui_running() {
+    ps -ef | grep -v grep | grep -q "[x]6200_ui_v100"
+}
+
+screen_running() {
+    ps -ef | grep -v grep | grep -q "[q]mlscene"
+}
+
+# Who currently holds the display open?
+drm_holders() {
+    for link in /proc/[0-9]*/fd/*; do
+        target=$(readlink "$link" 2>/dev/null) || continue
+        [ "$target" = "/dev/dri/card1" ] && echo "$link"
+    done
+}
+
+# A new full-screen client cannot configure the panel until the previous one
+# has really let go of DRM master.  Starting while it is still held makes the
+# KMS mode set fail (-EACCES) and leaves the panel in its old configuration,
+# which shows up as a rotated or mis-scaled screen.
+wait_for_display() {
+    n=0
+    while [ $n -lt 60 ]; do
+        [ -z "$(drm_holders)" ] && return 0
+        sleep 0.25
+        n=$((n + 1))
+    done
+    echo "warning: display still busy after 15s" >&2
+    return 1
+}
+
+park_stock_ui() {
+    # monit restarts x6200_ui_v100 within ~10s of it dying, which would fight
+    # this app for the display, so its supervision is paused for the session.
+    if [ -x "$MONIT_INIT" ]; then
+        "$MONIT_INIT" stop >/dev/null 2>&1 && MONIT_PARKED=1
+    fi
+    [ -x "$USERAPP" ] && "$USERAPP" stop >/dev/null 2>&1
+    n=0
+    while [ $n -lt 25 ] && ui_running; do
+        sleep 0.2
+        n=$((n + 1))
+    done
+}
+
+restore_stock_ui() {
+    if ! ui_running; then
+        [ -x "$USERAPP" ] && "$USERAPP" start >/dev/null 2>&1
+    fi
+    if [ "$MONIT_PARKED" = "1" ]; then
+        [ -x "$MONIT_INIT" ] && "$MONIT_INIT" start >/dev/null 2>&1
+        MONIT_PARKED=0
+    fi
+}
+
+run_screen() {
+    screen=${1:-$QML}
+
+    if screen_running; then
+        echo "BT Audio is already showing"
+        return 0
+    fi
+
+    trap 'restore_stock_ui' INT TERM EXIT
+    park_stock_ui
+    wait_for_display
+
+    # Ask for no EGLFS rotation: the logical screen is then the panel's own
+    # 480x800 frame and the screen rotates its 800x480 layout into it itself
+    # (see BtAudio.qml).  Pinned here rather than left to /etc/profile so the
+    # result does not depend on how the launcher was started.
+    #
+    # /etc/profile's 90 is what the stock GUI runs with, but on this driver it
+    # does not turn our surface: measured on the panel, an 800x480 layout under
+    # QT_QPA_EGLFS_ROTATION=90 comes up 90 degrees out (and Qt prints
+    # "Framebuffer size format is invalid."), while the same layout in the raw
+    # 480x800 frame can be turned upright by the app itself.  The angle lives in
+    # /etc/btaudio.conf; `btaudio calibrate` is how it was chosen.
+    export QT_QPA_EGLFS_ROTATION=0
+
+    echo "Showing $(basename "$screen") (CLOSE or Esc returns to the radio)"
+    # Keep the renderer's own diagnostics: a failed KMS mode set leaves the
+    # panel in the previous owner's configuration and shows up as a sideways
+    # or mis-scaled screen, so the log (which the screen also writes the frame
+    # size it was handed to) is the first place to look.
+    QT_QUICK_CONTROLS_STYLE=Material qmlscene "$screen" >"$SCREEN_LOG" 2>&1
+    rc=$?
+    restore_stock_ui
+    trap - INT TERM EXIT
+    return $rc
+}
+
+# --------------------------------------------------------------------------
+# Entry point
+# --------------------------------------------------------------------------
+case "$1" in
+    start)
+        daemon_start || exit 1
+        run_screen "$QML"
+        ;;
+    stop)
+        # A screen may be up in another session; put the radio back either way.
+        if ! ui_running; then
+            [ -x "$USERAPP" ] && "$USERAPP" start >/dev/null 2>&1
+            [ -x "$MONIT_INIT" ] && "$MONIT_INIT" start >/dev/null 2>&1
+        fi
+        daemon_stop
+        ;;
+    status)
+        daemon_status
+        if ui_running; then echo "$UI_PROC running"; else echo "$UI_PROC NOT running"; fi
+        ;;
+    daemon)
+        case "$2" in
+            start)   daemon_start ;;
+            stop)    daemon_stop ;;
+            status)  daemon_status ;;
+            restart) daemon_stop >/dev/null; daemon_start ;;
+            *)       echo "Usage: $0 daemon {start|stop|restart|status}" >&2; exit 1 ;;
+        esac
+        ;;
+    calibrate)
+        # Choose the screen rotation for this panel: rotate until the arrow
+        # points up, then USE THIS.  Saved to /etc/btaudio.conf.
+        run_screen "$APP_DIR/Calibrate.qml"
+        ;;
+    keymap)
+        # Map the front-panel navigation buttons: the screen asks for one button
+        # per role and the backend records the keycode it sees.  Saved to
+        # /etc/btaudio.conf as it goes.
+        daemon_start || exit 1
+        run_screen "$APP_DIR/KeyMap.qml"
+        ;;
+    snapshot)
+        # Render the screen offscreen (no display contention) to a PNG so the
+        # layout can be reviewed without photographing the radio.
+        out=${2:-/tmp/btaudio-screen.png}
+        printf '%s' "$out" > "$SNAP_MARKER"
+        QML_XHR_ALLOW_FILE_READ=1 QT_QPA_PLATFORM=offscreen QT_QUICK_BACKEND=software \
+            qmlscene "$QML"
+        rm -f "$SNAP_MARKER"
+        if [ -s "$out" ]; then echo "wrote $out"; else echo "snapshot failed"; exit 1; fi
+        ;;
+    restart)
+        daemon_stop
+        daemon_start
+        ;;
+    *)
+        echo "Usage: $0 {start|stop|restart|status|calibrate|keymap|daemon {start|stop|restart|status}|snapshot [FILE]}" >&2
+        exit 1
+        ;;
+esac
+
+exit 0

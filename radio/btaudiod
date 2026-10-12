@@ -1,0 +1,1484 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+btaudiod -- Bluetooth audio-out manager for the Xiegu X6200.
+
+The stock X6200 GUI pairs Bluetooth devices over QtBluetooth but only for CAT
+(serial/RFCOMM) work; it has no concept of routing the radio's audio to an A2DP
+headset.  This daemon provides exactly that, plus a small JSON API the QML
+front-end drives.
+
+How the audio gets there
+------------------------
+The X6200's demodulated audio arrives from the FPGA on the SoC codec's capture
+side, which is exposed as the ALSA PCM ``mixcapture`` (a dsnoop, so several
+readers may share it).  The stock UI plays it straight to ALSA, bypassing
+PulseAudio -- which is why nothing shows up in PA while the radio talks.
+
+We therefore never touch the radio's own playback path.  Instead we *tap*
+``mixcapture`` and loop it into the Bluetooth sink that PulseAudio creates when
+an A2DP headset connects::
+
+    mixcapture  ->  module-loopback  ->  bluez_sink.<MAC>.a2dp_sink  ->  headset
+
+Both ends are PulseAudio modules, so rate conversion and latency are handled for
+us and the radio keeps playing to its speaker (and over Bluetooth) untouched.
+
+BlueZ is driven directly over D-Bus (synchronously -- no GLib main loop is
+available on this Buildroot image).  Pairing is delegated to ``bluetoothctl``
+because that gives us a working pairing agent for free.
+
+Run as root.  Control surface:  http://127.0.0.1:8637/state  ,  POST /cmd
+"""
+
+import json
+import os
+import re
+import select
+import signal
+import struct
+import subprocess
+import sys
+import threading
+import time
+
+try:
+    import dbus
+except ImportError:  # pragma: no cover
+    sys.stderr.write("btaudiod: python3-dbus is required\n")
+    sys.exit(1)
+
+# --------------------------------------------------------------------------
+# Configuration
+# --------------------------------------------------------------------------
+
+BLUEZ = "org.bluez"
+OM_IFACE = "org.freedesktop.DBus.ObjectManager"
+PROP_IFACE = "org.freedesktop.DBus.Properties"
+ADAPTER_IFACE = "org.bluez.Adapter1"
+DEVICE_IFACE = "org.bluez.Device1"
+
+#: ALSA/Pulse source carrying the radio's audio (see module docstring).
+RADIO_SOURCE = os.environ.get("BTAUDIO_SOURCE", "alsa_input.mixcapture")
+
+#: Localhost JSON API for the QML front-end.
+HTTP_HOST = os.environ.get("BTAUDIO_HOST", "127.0.0.1")
+HTTP_PORT = int(os.environ.get("BTAUDIO_PORT", "8637"))
+
+#: Seconds between BlueZ state refreshes.
+POLL_INTERVAL = float(os.environ.get("BTAUDIO_POLL", "1.0"))
+
+#: Remember the chosen sink volume and routing target across runs.  This lives
+#: on the (writable) root filesystem, not /tmp: the daemon starts at boot and has
+#: to remember that a headset should be bridged again after a power cycle.
+STATE_FILE = os.environ.get("BTAUDIO_STATE", "/var/lib/btaudio.state")
+LOG_FILE = os.environ.get("BTAUDIO_LOG", "/tmp/btaudio.log")
+PID_FILE = os.environ.get("BTAUDIO_PID", "/tmp/btaudiod.pid")
+
+DEFAULT_VOLUME = 70
+
+#: The radio's own output stage, used for the on-screen "local speaker" switch.
+#: Muting it leaves the capture side (where the Bluetooth bridge taps in) alone,
+#: so the headset keeps playing while the speaker goes quiet.
+MIXER_CARD = os.environ.get("BTAUDIO_MIXER_CARD", "0")
+MIXER_CONTROL = os.environ.get("BTAUDIO_MIXER_CONTROL", "Headphone")
+
+#: Front-panel keypad and its shortcuts (see /etc/btaudio.conf).
+KEYPAD_DEVICE = os.environ.get("BTAUDIO_KEYPAD", "/dev/input/event0")
+CONFIG_FILE = os.environ.get("BTAUDIO_CONF", "/etc/btaudio.conf")
+LAUNCHER = os.environ.get("BTAUDIO_LAUNCHER", "/usr/share/support/btaudio")
+APP_DIR = os.environ.get("BTAUDIO_APP_DIR", "/usr/app_qt/btaudio")
+
+EVI = struct.Struct("<IIHHi")  # struct input_event on 32-bit ARM
+
+#: Settings that are text rather than numbers (device paths).
+STRING_KEYS = ("scroll_device",)
+
+DEFAULT_KEYS = {
+    "launch": None,        # keycode that opens the screen (pressed twice)
+    "launch_presses": 2,   # how many presses within 2s count as the shortcut
+    "exit_presses": 3,     # ...and how many close it again while it is up
+    # On-screen navigation.  `btaudio keymap` fills these in: it asks for a
+    # button per role and the daemon reads the keypad itself, so nothing here
+    # depends on what Qt does with the keymap's vendor keycodes.
+    "up": None,
+    "down": None,
+    "select": None,
+    "back": None,
+    # Scrolling with a rotary encoder instead of (or as well as) the buttons:
+    # the evdev device to read, which way round it feels right, and how many
+    # reported units make one step.  `btaudio keymap` learns the device -- turn
+    # the knob when the screen asks and the path is written here.
+    "scroll_device": None,
+    "scroll_invert": 0,
+    "scroll_step": 1,
+    # How far the 800x480 UI is rotated inside the frame Qt hands it.  "auto"
+    # (the normal setting) is decided by the shape of that frame: 270 for the
+    # panel's own 480x800 frame, 0 for a landscape one.  `btaudio calibrate` can
+    # pin an angle here if a display ever disagrees.
+    "rotation": "auto",
+}
+
+#: Bluetooth UUID prefixes that mean the *remote* device can play audio we send
+#: it.  BlueZ hands these out in full (0000110b-0000-1000-8000-00805f9b34fb), so
+#: they are matched by prefix.
+#:   0000110b  Audio Sink      -- A2DP headphones, speakers, TVs, TV boxes
+#:   00001108  Headset         -- mono/legacy headsets
+#:   0000111e  Handsfree       -- car kits and similar
+AUDIO_OUT_PREFIXES = ("0000110b", "00001108", "0000111e")
+
+#: Major "device class" for Audio/Video gear.
+CLASS_MAJOR_AUDIO_VIDEO = 4
+
+PA_ENV = dict(os.environ)
+PA_ENV.setdefault("PULSE_SERVER", "/tmp/pulse/native")
+PA_ENV.setdefault("XDG_RUNTIME_DIR", "/tmp")
+PA_ENV["LC_ALL"] = "C"
+
+ANSI = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+
+_log_lock = threading.Lock()
+_log_lines = []
+
+
+def log(msg):
+    """Append to the in-memory log ring and to the log file."""
+    stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+    line = "%s %s" % (stamp, msg)
+    with _log_lock:
+        _log_lines.append(line)
+        del _log_lines[:-200]
+    try:
+        with open(LOG_FILE, "a") as fh:
+            fh.write(line + "\n")
+    except OSError:
+        pass
+
+
+# --------------------------------------------------------------------------
+# Small helpers
+# --------------------------------------------------------------------------
+
+def run(cmd, timeout=25):
+    """Run a command, returning (returncode, combined_output)."""
+    try:
+        proc = subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=PA_ENV
+        )
+    except OSError as exc:
+        return 127, "cannot execute %s: %s" % (cmd[0], exc)
+    try:
+        out, _ = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        out, _ = proc.communicate()
+        return 124, (out or b"").decode("utf-8", "replace") + "\n[timed out]"
+    return proc.returncode, (out or b"").decode("utf-8", "replace")
+
+
+def pactl(*args, **kw):
+    """Run pactl and return its output lines (empty list on failure)."""
+    rc, out = run(["pactl"] + list(args), timeout=kw.get("timeout", 15))
+    if rc != 0:
+        log("pactl %s failed rc=%d: %s" % (" ".join(args), rc, out.strip()[:200]))
+        return []
+    return out.splitlines()
+
+
+def clean(text):
+    return ANSI.sub("", text or "")
+
+
+# --------------------------------------------------------------------------
+# BlueZ access (synchronous D-Bus, no main loop)
+# --------------------------------------------------------------------------
+
+class BlueZ(object):
+    def __init__(self):
+        self._bus = None
+        self._lock = threading.Lock()
+
+    @property
+    def bus(self):
+        with self._lock:
+            if self._bus is None:
+                self._bus = dbus.SystemBus(private=True)
+            return self._bus
+
+    def _obj(self, path):
+        # introspect=False keeps every call a single round-trip.
+        return self.bus.get_object(BLUEZ, path, introspect=False)
+
+    def objects(self):
+        om = dbus.Interface(self._obj("/"), OM_IFACE)
+        return om.GetManagedObjects()
+
+    def adapter_path(self):
+        for path, ifaces in self.objects().items():
+            if ADAPTER_IFACE in ifaces:
+                return path
+        return None
+
+    def adapter(self):
+        """Return the adapter's properties dict, or None if hci0 is absent."""
+        for path, ifaces in self.objects().items():
+            if ADAPTER_IFACE in ifaces:
+                props = dict(ifaces[ADAPTER_IFACE])
+                props["_path"] = path
+                return props
+        return None
+
+    def devices(self):
+        """Return a list of (path, props) for every known remote device."""
+        found = []
+        for path, ifaces in self.objects().items():
+            if DEVICE_IFACE in ifaces:
+                props = dict(ifaces[DEVICE_IFACE])
+                props["_path"] = path
+                found.append((path, props))
+        return found
+
+    def set_adapter_prop(self, name, value):
+        path = self.adapter_path()
+        if not path:
+            raise RuntimeError("no Bluetooth adapter")
+        dbus.Interface(self._obj(path), PROP_IFACE).Set(ADAPTER_IFACE, name, value)
+
+    def start_discovery(self):
+        path = self.adapter_path()
+        if not path:
+            raise RuntimeError("no Bluetooth adapter")
+        adapter = dbus.Interface(self._obj(path), ADAPTER_IFACE)
+        try:
+            # Keep discovery independent of transport so BLE-only devices show up.
+            adapter.SetDiscoveryFilter(
+                dbus.Dictionary(
+                    {"Transport": dbus.String("auto"), "DuplicateData": dbus.Boolean(True)},
+                    signature="sv",
+                )
+            )
+        except dbus.DBusException as exc:
+            log("SetDiscoveryFilter: %s" % exc.get_dbus_name())
+        try:
+            adapter.StartDiscovery()
+        except dbus.DBusException as exc:
+            # InProgress is harmless: something (usually the stock UI) is scanning.
+            if "InProgress" not in str(exc.get_dbus_name()):
+                raise
+
+    def stop_discovery(self):
+        path = self.adapter_path()
+        if not path:
+            return
+        try:
+            dbus.Interface(self._obj(path), ADAPTER_IFACE).StopDiscovery()
+        except dbus.DBusException:
+            pass
+
+    def device_method(self, addr, method, *args):
+        path = self._device_path(addr)
+        if not path:
+            raise RuntimeError("unknown device %s" % addr)
+        dbus.Interface(self._obj(path), DEVICE_IFACE).__getattr__(method)(*args)
+
+    def _device_path(self, addr):
+        for path, props in self.devices():
+            if str(props.get("Address", "")).upper() == addr.upper():
+                return path
+        return None
+
+    def pair(self, addr):
+        """Pair through bluetoothctl so its pairing agent handles the exchange."""
+        self.stop_discovery()
+        log("pairing %s" % addr)
+        rc, out = run(
+            ["bluetoothctl", "--agent", "NoInputNoOutput", "--timeout", "35", "pair", addr],
+            timeout=50,
+        )
+        text = clean(out)
+        if "Pairing successful" not in text and "AlreadyExists" not in text:
+            return False, text.strip()[-300:] or "pairing failed"
+        # Trust so the headset can reconnect without ceremony.
+        run(["bluetoothctl", "--timeout", "15", "trust", addr], timeout=25)
+        return True, "paired"
+
+    def connect(self, addr):
+        """Connect all supported profiles -- A2DP included for audio devices."""
+        self.device_method(addr, "Connect")
+        return True, "connecting"
+
+    def disconnect(self, addr):
+        self.device_method(addr, "Disconnect")
+        return True, "disconnecting"
+
+    def forget(self, addr):
+        self.device_method(addr, "Remove")
+        return True, "removed"
+
+
+# --------------------------------------------------------------------------
+# PulseAudio side: sink discovery and the loopback that carries the audio
+# --------------------------------------------------------------------------
+
+def mac_to_pa(addr):
+    return addr.upper().replace(":", "_")
+
+
+def find_bluetooth_sink(addr):
+    """Return the PulseAudio sink name PulseAudio made for this device."""
+    want = "bluez_sink." + mac_to_pa(addr)
+    for line in pactl("list", "short", "sinks"):
+        parts = line.split("\t")
+        if len(parts) >= 2 and parts[1].lower().startswith(want.lower()):
+            return parts[1]
+    return None
+
+
+def list_bluetooth_sinks():
+    sinks = []
+    for line in pactl("list", "short", "sinks"):
+        parts = line.split("\t")
+        if len(parts) >= 2 and parts[1].lower().startswith("bluez_sink."):
+            sinks.append(parts[1])
+    return sinks
+
+
+def sink_volume(sink):
+    """Read the first volume figure pactl reports for a sink, as a percentage."""
+    out = pactl("list", "sinks")
+    inside = False
+    for line in out:
+        if line.startswith("Sink #"):
+            inside = False
+        if ("Name: " + sink) in line:
+            inside = True
+            continue
+        if inside and "Volume:" in line:
+            match = re.search(r"(\d+)%", line)
+            if match:
+                return int(match.group(1))
+    return None
+
+
+def set_sink_volume(sink, percent):
+    percent = max(0, min(150, int(percent)))
+    pactl("set-sink-volume", sink, "%d%%" % percent)
+    return percent
+
+
+def write_config_value(name, value):
+    """Set NAME=VALUE in the config file, preserving comments and layout."""
+    lines = []
+    try:
+        with open(CONFIG_FILE) as fh:
+            lines = fh.read().splitlines()
+    except OSError:
+        pass
+
+    out = []
+    found = False
+    for line in lines:
+        bare = line.split("#", 1)[0].strip()
+        if bare.lower().startswith(name.lower() + "="):
+            out.append("%s=%s" % (name, value))
+            found = True
+        else:
+            out.append(line)
+    if not found:
+        out.append("%s=%s" % (name, value))
+
+    try:
+        with open(CONFIG_FILE, "w") as fh:
+            fh.write("\n".join(out) + "\n")
+    except OSError as exc:
+        log("config: cannot save %s: %s" % (name, exc))
+
+
+def load_config():
+    """Read /etc/btaudio.conf -- simple KEY=VALUE lines, '#' comments."""
+    keys = dict(DEFAULT_KEYS)
+    try:
+        with open(CONFIG_FILE) as fh:
+            for raw in fh:
+                line = raw.split("#", 1)[0].strip()
+                if not line or "=" not in line:
+                    continue
+                name, value = line.split("=", 1)
+                name = name.strip().lower()
+                value = value.strip()
+                if name not in keys:
+                    continue
+                if name in STRING_KEYS:
+                    keys[name] = value or None
+                    continue
+                if value.lower() == "auto":
+                    keys[name] = "auto"
+                    continue
+                try:
+                    keys[name] = int(value, 0) if value else None
+                except ValueError:
+                    # A single unreadable value must not silently throw away
+                    # every other setting in the file.
+                    log("config: ignoring %s=%r" % (name, value))
+                    keys[name] = None
+    except (OSError, ValueError) as exc:
+        log("config: using defaults (%s)" % exc)
+    return keys
+
+
+def press_is_shortcut(press_times, now, needed, window=2.0):
+    """Double-press rule for the front-panel shortcut.
+
+    ``press_times`` is the list of recent presses of the launch button; returns
+    ``(remaining_times, fired)``.  Keeping this pure makes the rule testable
+    without a keypad attached -- see dev/keywatch-test.py.
+    """
+    times = [t for t in press_times if now - t < window]
+    times.append(now)
+    if len(times) >= max(1, needed):
+        return [], True
+    return times, False
+
+
+def launch_press_outcome(press_times, now, launch_needed, exit_needed, screen_up,
+                         window=2.0):
+    """Work out what one press of the shortcut button means.
+
+    The same button opens the screen while it is down and closes it while it is
+    up, each with its own press count, so the button never has to be hunted for
+    on a panel full of keys.  Returns ``(remaining_times, action)`` with action
+    "launch", "exit" or None, which makes the whole rule checkable without a
+    keypad -- see dev/keywatch-test.py.
+    """
+    needed = exit_needed if screen_up else launch_needed
+    times, fired = press_is_shortcut(press_times, now, needed, window)
+    if not fired:
+        return times, None
+    return times, "exit" if screen_up else "launch"
+
+
+#: Front-panel navigation roles, in the order `btaudio keymap` asks for them.
+KEYMAP_ROLES = ("up", "down", "select", "back")
+
+
+def session_roles(session):
+    """The roles a mapping session asks for.
+
+    Usually all four, but a session can be narrowed to one -- `btaudio keymap
+    select`, or the `arm` API -- so a single button can be moved without being
+    walked through the whole set.
+    """
+    roles = session.get("roles") if session else None
+    chosen = [role for role in (roles or []) if role in KEYMAP_ROLES]
+    return chosen or list(KEYMAP_ROLES)
+
+
+def keymap_message(session):
+    """The line the mapping screen shows for the session's current step."""
+    roles = session_roles(session)
+    step = int(session.get("step") or 0)
+    if step >= len(roles):
+        parts = []
+        for role in roles:
+            code = session.get("codes", {}).get(role)
+            parts.append("%s=%s" % (role.upper(), code if code is not None else "-"))
+        return "Saved   " + "   ".join(parts)
+    return "Press the button you want for " + roles[step].upper()
+
+
+def keymap_advance(session, code=None):
+    """Move a mapping session on by one role, binding CODE if there is one.
+
+    ``code`` of None means "skip this role" (leave it unbound).  Returns the role
+    that was dealt with, or None when there is nothing left to do.  Pure, so a
+    whole mapping run can be driven from a test instead of real buttons.
+    """
+    if not session or not session.get("active"):
+        return None
+    roles = session_roles(session)
+    step = int(session.get("step") or 0)
+    if step >= len(roles):
+        session["active"] = False
+        return None
+    role = roles[step]
+    if code is not None:
+        session.setdefault("codes", {})[role] = int(code)
+    session["step"] = step + 1
+    if session["step"] >= len(roles):
+        session["active"] = False
+    session["message"] = keymap_message(session)
+    return role
+
+
+def keymap_capture(session, code, launch_code=None):
+    """Offer a front-panel press to a running mapping session.
+
+    Returns the role the press was bound to, or None for a press that is not
+    part of a capture: no session, a finished one, or the shortcut button, which
+    stays reserved for opening and closing the screen so it can never be
+    captured over by accident.
+    """
+    if code is None or not session or not session.get("active"):
+        return None
+    if launch_code is not None and code == launch_code:
+        return None
+    return keymap_advance(session, code)
+
+
+def rotary_devices():
+    """The radio's rotary encoders, as (name, path) pairs.
+
+    The device tree exposes them as rotary@0..3, each with a single REL axis of
+    its own.  They are resolved by name rather than by event number so this keeps
+    working if the numbers move.
+    """
+    found = []
+    try:
+        entries = sorted(os.listdir("/sys/class/input"))
+    except OSError:
+        return found
+    for entry in entries:
+        if not entry.startswith("event"):
+            continue
+        try:
+            with open("/sys/class/input/%s/device/name" % entry) as fh:
+                name = fh.read().strip()
+        except OSError:
+            continue
+        if name.startswith("rotary"):
+            found.append((name, "/dev/input/" + entry))
+    return found
+
+
+def rotary_steps(accumulator, delta, step=1):
+    """Turn raw REL deltas from a knob into whole steps.
+
+    Returns ``(leftover, directions)``; a direction is +1 clockwise or -1 the
+    other way, and leftover is the part of a step still pending.  Encoders differ
+    in how many units they report per detent, so this is a function of its own --
+    and pure, so a sign error shows up in a test rather than in a list that
+    scrolls the wrong way.
+    """
+    step = max(1, int(step or 1))
+    accumulator += int(delta or 0)
+    directions = []
+    while abs(accumulator) >= step:
+        direction = 1 if accumulator > 0 else -1
+        accumulator -= direction * step
+        directions.append(direction)
+    return accumulator, directions
+
+
+def screen_running():
+    """True when one of our QML screens is up.
+
+    That means the main screen *or* a helper screen (`btaudio calibrate`,
+    `btaudio keymap`) -- while any of them owns the panel, the launch button is
+    the way out, not the way in.
+    """
+    prefix = APP_DIR.rstrip("/") + "/"
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit():
+            continue
+        try:
+            with open("/proc/%s/cmdline" % entry, "rb") as fh:
+                cmd = fh.read().decode("utf-8", "replace")
+        except OSError:
+            continue
+        if "qmlscene" in cmd and prefix in cmd:
+            return True
+    return False
+
+
+# --------------------------------------------------------------------------
+# Front-panel keypad
+# --------------------------------------------------------------------------
+
+class KeyWatch(threading.Thread):
+    """Watch the radio's keypad and turn presses into app commands.
+
+    Qt's EGLFS input stack can silently drop the keymap's vendor keycodes
+    (0x2C0-0x2DD), so the front panel is handled here instead of inside the QML:
+    navigation is relayed to the screen through the /state poll, which works no
+    matter what Qt does with those codes.  Keypad reads are passive, so the
+    stock UI keeps seeing its own buttons.
+    """
+
+    WINDOW = 2.0  # seconds within which repeated presses count as a shortcut
+
+    def __init__(self, stop_event, keys, daemon):
+        threading.Thread.__init__(self, name="keywatch")
+        self.daemon = True
+        self.stop_event = stop_event
+        self.keys = keys
+        self.daemon_state = daemon
+
+    def run(self):
+        launch_code = self.keys.get("launch")
+        bound = self.daemon_state.nav_codes()
+        pairs = ["%s=%s" % (role, code) for role, code in sorted(bound.items())]
+        if launch_code is not None:
+            pairs.insert(0, "launch=%d" % launch_code)
+        log("keywatch: %s" % (", ".join(pairs) if pairs else "nothing bound yet"))
+        # Note: this keeps running even with nothing bound, because `btaudio
+        # keymap` binds buttons while the screen is up -- presses have to be
+        # readable at any time, and reading the keypad is passive.
+        try:
+            fh = open(KEYPAD_DEVICE, "rb", buffering=0)
+        except OSError as exc:
+            log("keywatch: cannot open %s: %s" % (KEYPAD_DEVICE, exc))
+            return
+
+        needed = max(1, int(self.keys.get("launch_presses") or 1))
+        exit_needed = max(1, int(self.keys.get("exit_presses") or 3))
+        press_times = []
+        while not self.stop_event.is_set():
+            ready, _, _ = select.select([fh], [], [], 1.0)
+            if not ready:
+                continue
+            try:
+                data = fh.read(EVI.size)
+            except OSError:
+                continue
+            if not data or len(data) < EVI.size:
+                continue
+            _, _, type_, code, value = EVI.unpack(data)
+            if type_ != 1 or value != 1:      # key press only
+                continue
+            now = time.time()
+
+            # A mapping session claims the press first: whatever button is
+            # pressed next becomes the binding the screen is asking for.
+            if self.daemon_state.capture_code(code):
+                continue
+
+            if code == launch_code:
+                press_times, what = launch_press_outcome(
+                    press_times, now, needed, exit_needed, screen_running(),
+                    self.WINDOW)
+                if what == "launch":
+                    self._launch()
+                elif what == "exit":
+                    self._exit()
+                else:
+                    log("keywatch: shortcut press %d" % len(press_times))
+                continue
+
+            action = self.daemon_state.action_for_code(code)
+            if action is None:
+                continue
+            self.daemon_state.relay_nav(action)
+            log("keywatch: nav %s" % action)
+
+    @staticmethod
+    def _launch():
+        if screen_running():
+            log("keywatch: screen already up")
+            return
+        log("keywatch: launching the BT Audio screen")
+        try:
+            subprocess.Popen(
+                [LAUNCHER, "start"], start_new_session=True,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+        except OSError as exc:
+            log("keywatch: launch failed: %s" % exc)
+
+    def _exit(self):
+        """Ask the screen to close; the launcher puts the stock GUI back."""
+        self.daemon_state.relay_nav("exit")
+        log("keywatch: closing the BT Audio screen")
+
+
+class RotaryWatch(threading.Thread):
+    """Turn the chosen rotary encoder into up/down navigation.
+
+    The encoders are separate evdev devices (rotary@0..3), one REL axis each, and
+    they are only *read* here, never grabbed, so the stock GUI keeps its knobs
+    whenever it is on screen.  While the BT Audio screen is up the stock GUI is
+    parked, so the same knob scrolls the list instead of tuning anything.
+
+    This thread also answers `btaudio keymap`'s "which knob?" question: while a
+    learn run is waiting it watches every encoder and reports the first that
+    moves.
+    """
+
+    EV_REL = 0x02
+
+    def __init__(self, stop_event, daemon):
+        threading.Thread.__init__(self, name="rotary")
+        self.daemon = True
+        self.stop_event = stop_event
+        self.daemon_state = daemon
+
+    def run(self):
+        handles = {}
+        accumulator = 0
+        while not self.stop_event.is_set():
+            wanted = {}
+            if self.daemon_state.scroll_device():
+                wanted[self.daemon_state.scroll_device()] = True
+            if self.daemon_state.rotary_learning():
+                for _name, path in rotary_devices():
+                    wanted.setdefault(path, False)
+            for path in list(handles):
+                if path not in wanted:
+                    handles.pop(path).close()
+            for path in wanted:
+                if path in handles:
+                    continue
+                try:
+                    handles[path] = open(path, "rb", buffering=0)
+                    log("rotary: watching %s" % path)
+                except OSError as exc:
+                    log("rotary: cannot open %s: %s" % (path, exc))
+            if not handles:
+                accumulator = 0
+                self.stop_event.wait(1.0)
+                continue
+
+            ready, _, _ = select.select(list(handles.values()), [], [], 1.0)
+            for fh in ready:
+                try:
+                    data = fh.read(EVI.size)
+                except OSError:
+                    continue
+                if not data or len(data) < EVI.size:
+                    continue
+                _, _, type_, axis, value = EVI.unpack(data)
+                if type_ != self.EV_REL:
+                    continue
+                path = fh.name
+                if self.daemon_state.rotary_learning():
+                    self.daemon_state.record_rotary(path, axis, value)
+                if path != self.daemon_state.scroll_device():
+                    continue
+                accumulator, directions = rotary_steps(
+                    accumulator, value, self.daemon_state.scroll_step())
+                for direction in directions:
+                    self._scroll(direction)
+
+    def _scroll(self, direction):
+        down = (direction > 0) != bool(self.daemon_state.scroll_invert())
+        self.daemon_state.relay_nav("down" if down else "up")
+        log("rotary: %s" % ("down" if down else "up"))
+
+
+def local_mute_state():
+    """True/False when the local output state is readable, else None."""
+    rc, out = run(["amixer", "-c", MIXER_CARD, "sget", MIXER_CONTROL], timeout=6)
+    if rc != 0:
+        return None
+    return "[off]" in out
+
+
+def set_local_mute(muted):
+    run(
+        ["amixer", "-c", MIXER_CARD, "sset", MIXER_CONTROL,
+         "mute" if muted else "unmute"],
+        timeout=6,
+    )
+
+
+# --------------------------------------------------------------------------
+# The daemon
+# --------------------------------------------------------------------------
+
+class BtAudioDaemon(object):
+    def __init__(self):
+        self.bluez = BlueZ()
+        self.lock = threading.Lock()
+
+        self.devices = []
+        self.adapter = None
+        self.route_enabled = False
+        self.route_addr = None
+        self.route_module = None
+        self.route_sink = None
+        self.volume = DEFAULT_VOLUME
+        self.local_muted = False
+        self.last_error = None
+        self.keys = load_config()
+        self.nav = {"seq": 0, "action": None}
+        # One counter for every front-panel source (keypad and knob), so the
+        # screen never sees two actions with the same sequence number.
+        self.nav_seq = 0
+        self.nav_lock = threading.Lock()
+        # Which knob scrolls the list, and whether a learn run is waiting.
+        self.rotary = {"learning": False, "device": None, "axis": None,
+                       "delta": None, "message": "No scroll knob yet."}
+        self.rotary_lock = threading.Lock()
+        # Front-panel button mapping session (`btaudio keymap`).
+        self.keymap = {"active": False, "step": 0, "codes": {},
+                       "message": keymap_message({"step": 0, "codes": {}})}
+        self.keymap_lock = threading.Lock()
+
+        self._load_state()
+        # Make the hardware agree with the remembered preference.
+        if self.local_muted:
+            set_local_mute(True)
+
+    # -- persisted preference ------------------------------------------------
+
+    def _load_state(self):
+        try:
+            with open(STATE_FILE) as fh:
+                data = json.load(fh)
+            self.volume = int(data.get("volume", DEFAULT_VOLUME))
+            self.route_addr = data.get("addr")
+            self.route_enabled = bool(data.get("enabled", False))
+            self.local_muted = bool(data.get("local_muted", False))
+        except (OSError, ValueError):
+            pass
+
+    def _save_state(self):
+        try:
+            with open(STATE_FILE, "w") as fh:
+                json.dump(
+                    {
+                        "volume": self.volume,
+                        "addr": self.route_addr,
+                        "enabled": self.route_enabled,
+                        "local_muted": self.local_muted,
+                    },
+                    fh,
+                )
+        except OSError:
+            pass
+
+    # -- device classification ----------------------------------------------
+
+    @classmethod
+    def describe(cls, path, props, sink=None):
+        uuids = [str(u).lower() for u in props.get("UUIDs", [])]
+        addr = str(props.get("Address", ""))
+        icon = str(props.get("Icon", ""))
+        try:
+            dev_class = int(props.get("Class", 0))
+        except (TypeError, ValueError):
+            dev_class = 0
+
+        # Capability: does the device offer to receive audio?
+        capability = any(u.startswith(AUDIO_OUT_PREFIXES) for u in uuids)
+        if not capability and icon.startswith("audio"):
+            capability = True
+        if not capability and ((dev_class >> 8) & 0x1F) == CLASS_MAJOR_AUDIO_VIDEO:
+            capability = True
+
+        rssi = props.get("RSSI")
+        return {
+            "addr": addr,
+            "name": str(props.get("Alias") or props.get("Name") or addr),
+            "alias": str(props.get("Alias", "")),
+            "paired": bool(props.get("Paired", False)),
+            "trusted": bool(props.get("Trusted", False)),
+            "connected": bool(props.get("Connected", False)),
+            "rssi": int(rssi) if rssi is not None else None,
+            "icon": icon,
+            "audio": capability,
+            # Ground truth: PulseAudio only creates a bluez sink once the A2DP
+            # link is actually up, so this is what makes routing possible.
+            "ready": sink is not None,
+            "sink": sink,
+            "uuids": uuids,
+            "path": str(path),
+        }
+
+    # -- polling -------------------------------------------------------------
+
+    def refresh(self):
+        # Keep the local-speaker switch honest (something else may have moved it).
+        reported = local_mute_state()
+        if reported is not None:
+            self.local_muted = reported
+
+        try:
+            self.adapter = self.bluez.adapter()
+            raw = self.bluez.devices()
+        except dbus.DBusException as exc:
+            log("BlueZ lookup failed: %s" % exc)
+            self.last_error = "Bluetooth stack unavailable: %s" % exc.get_dbus_name()
+            return
+
+        # One pactl call for every Bluetooth sink, rather than one per device.
+        live_sinks = set(list_bluetooth_sinks())
+        described = []
+        for path, props in raw:
+            addr = str(props.get("Address", ""))
+            sink = None
+            for name in live_sinks:
+                if name.lower().startswith("bluez_sink." + mac_to_pa(addr).lower()):
+                    sink = name
+                    break
+            described.append(self.describe(path, props, sink))
+
+        # Most useful first: connected, then paired, then audio-capable, then
+        # the strongest signal.
+        def sort_key(d):
+            return (
+                0 if d["ready"] else 1,
+                0 if d["connected"] else 1,
+                0 if d["audio"] else 1,
+                0 if d["paired"] else 1,
+                -(d["rssi"] if d["rssi"] is not None else -999),
+                d["name"].lower(),
+            )
+
+        described.sort(key=sort_key)
+        with self.lock:
+            self.devices = described
+
+    # -- audio routing -------------------------------------------------------
+
+    def _target_device(self):
+        with self.lock:
+            devices = list(self.devices)
+        if self.route_addr:
+            for dev in devices:
+                if dev["addr"].upper() == self.route_addr.upper():
+                    return dev
+        # Prefer a connected device PulseAudio has actually published a sink
+        # for; fall back to anything connected that looks like an audio device.
+        for dev in devices:
+            if dev["connected"] and dev["ready"]:
+                return dev
+        for dev in devices:
+            if dev["connected"] and dev["audio"]:
+                return dev
+        return None
+
+    def sync_route(self):
+        """Make the actual loopback match the desired routing state.
+
+        Called from the poller so the bridge follows reality: it is created once
+        the headset has connected (and PulseAudio has published its sink) and
+        torn down when the device goes away.
+        """
+        if not self.route_enabled:
+            if self.route_module is not None:
+                log("routing off: unloading loopback %s" % self.route_module)
+                pactl("unload-module", str(self.route_module))
+                self.route_module = None
+                self.route_sink = None
+            return
+
+        target = self._target_device()
+        if target is None or not target["connected"]:
+            # Waiting for the headset; drop a stale bridge if there is one.
+            if self.route_module is not None:
+                log("target disconnected: unloading loopback %s" % self.route_module)
+                pactl("unload-module", str(self.route_module))
+                self.route_module = None
+                self.route_sink = None
+            return
+
+        sink = find_bluetooth_sink(target["addr"])
+        if sink is None:
+            return  # sink not published yet
+        if sink == self.route_sink and self.route_module is not None:
+            return  # already bridging
+
+        if self.route_module is not None:
+            pactl("unload-module", str(self.route_module))
+            self.route_module = None
+
+        lines = pactl(
+            "load-module", "module-loopback",
+            "source=" + RADIO_SOURCE,
+            "sink=" + sink,
+            "latency_msec=60",
+            "source_dont_move=true",
+            "sink_dont_move=true",
+        )
+        try:
+            self.route_module = int(lines[0].strip())
+            self.route_sink = sink
+            log("bridging %s -> %s (module %s)" % (RADIO_SOURCE, sink, self.route_module))
+            set_sink_volume(sink, self.volume)
+        except (IndexError, ValueError):
+            self.route_module = None
+            self.last_error = "could not start the audio bridge"
+            log("FAILED to load module-loopback for %s" % sink)
+
+    # -- actions -------------------------------------------------------------
+
+    def action_scan(self, on):
+        if on:
+            self.bluez.start_discovery()
+        else:
+            self.bluez.stop_discovery()
+        return {"scanning": bool(on)}
+
+    def action_power(self, on):
+        self.bluez.set_adapter_prop("Powered", dbus.Boolean(bool(on)))
+        return {"powered": bool(on)}
+
+    def action_pair(self, addr):
+        ok, msg = self.bluez.pair(addr)
+        if not ok:
+            raise RuntimeError(msg)
+        # Pairing implies intent to use the device: route to it.
+        self.route_addr = addr
+        self.route_enabled = True
+        self._save_state()
+        self.bluez.connect(addr)
+        return {"paired": addr, "message": msg}
+
+    def action_connect(self, addr):
+        self.bluez.connect(addr)
+        return {"connecting": addr}
+
+    def action_disconnect(self, addr):
+        self.bluez.disconnect(addr)
+        return {"disconnecting": addr}
+
+    def action_forget(self, addr):
+        if self.route_addr and self.route_addr.upper() == addr.upper():
+            self.route_enabled = False
+            self.route_addr = None
+            self._save_state()
+        self.bluez.forget(addr)
+        return {"forgotten": addr}
+
+    def action_route(self, on, addr=None):
+        if addr:
+            self.route_addr = addr
+        self.route_enabled = bool(on)
+        self._save_state()
+        self.sync_route()
+        return {"route": self.route_state()}
+
+    def rotation_setting(self):
+        """Show the front-end which rotation to use: an angle, or "auto"."""
+        value = self.keys.get("rotation")
+        if value is None or str(value).strip().lower() in ("", "auto"):
+            return "auto"
+        try:
+            return int(value) % 360
+        except (TypeError, ValueError):
+            return "auto"
+
+    def action_rotation(self, degrees):
+        """Persist the screen rotation chosen by the calibration screen."""
+        if isinstance(degrees, str) and degrees.strip().lower() == "auto":
+            self.keys["rotation"] = "auto"
+            write_config_value("rotation", "auto")
+            return {"rotation": "auto"}
+        degrees = int(degrees) % 360
+        if degrees not in (0, 90, 180, 270):
+            raise RuntimeError("rotation must be a multiple of 90")
+        self.keys["rotation"] = degrees
+        write_config_value("rotation", degrees)
+        return {"rotation": degrees}
+
+    # -- front-panel buttons -------------------------------------------------
+
+    def nav_codes(self):
+        """The navigation buttons currently bound, as {role: keycode}."""
+        out = {}
+        for role in KEYMAP_ROLES:
+            code = self.keys.get(role)
+            if code is not None:
+                out[role] = code
+        return out
+
+    def action_for_code(self, code):
+        """Which navigation action a keycode means, or None."""
+        for role, bound in self.nav_codes().items():
+            if bound == code:
+                return role
+        return None
+
+    def capture_code(self, code):
+        """Keywatch hook: let a running mapping session claim a button press."""
+        with self.keymap_lock:
+            if self.keymap.get("active") and self.keymap.get("expires") \
+                    and time.time() > self.keymap["expires"]:
+                # An armed session that nobody answered must not sit there
+                # quietly turning the next button press into the binding.
+                self.keymap["active"] = False
+                self.keymap["message"] = "Mapping timed out"
+                log("keymap: session timed out")
+            role = keymap_capture(self.keymap, code, self.keys.get("launch"))
+            if role is None:
+                return False
+            code = int(code)
+            # Same button pressed for two roles: the latest one wins, so one
+            # keycode never means two different things.
+            for other in KEYMAP_ROLES:
+                if other != role and self.keys.get(other) == code:
+                    self.keys[other] = None
+                    write_config_value(other, "")
+                    log("keymap: %s released %d, now bound to %s" % (other, code, role))
+            self.keys[role] = code
+            # Written straight away, so a mapping run that is cut short still
+            # keeps whatever was captured up to that point.
+            write_config_value(role, code)
+            if self.keymap.get("active"):
+                log("keymap: %s = %d" % (role, code))
+            else:
+                log("keymap: finished -- %s" % self.keymap.get("message"))
+        return True
+
+    def keymap_state(self):
+        """Session plus what is bound, for the mapping screen.
+
+        Deliberately lock-free: it is called from inside action_keymap, which
+        already holds keymap_lock, and a stale-by-a-millisecond copy is harmless.
+        """
+        state = dict(self.keymap)
+        state["roles"] = session_roles(self.keymap)
+        state["bound"] = self.nav_codes()
+        return state
+
+    def action_keymap(self, cmd, role=None, roles=None, seconds=None):
+        """Start, step through, or finish a front-panel button mapping run.
+
+        `start` asks for all four roles unless `roles` narrows it; `arm` is the
+        one-button version used to move a single binding.
+        """
+        cmd = (cmd or "state").strip().lower()
+        with self.keymap_lock:
+            if cmd in ("start", "restart"):
+                chosen = [r for r in (roles or []) if r in KEYMAP_ROLES]
+                self.keymap = {"active": True, "step": 0, "codes": {},
+                               "roles": chosen or list(KEYMAP_ROLES),
+                               "expires": time.time() + float(seconds or 600),
+                               "message": ""}
+                self.keymap["message"] = keymap_message(self.keymap)
+                log("keymap: waiting for a button for %s"
+                    % session_roles(self.keymap)[0].upper())
+            elif cmd == "arm":
+                if role not in KEYMAP_ROLES:
+                    raise RuntimeError("unknown role %r" % role)
+                self.keymap = {"active": True, "step": 0, "codes": {},
+                               "roles": [role],
+                               "expires": time.time() + float(seconds or 120),
+                               "message": ""}
+                self.keymap["message"] = keymap_message(self.keymap)
+                log("keymap: waiting for a button for %s (single)" % role.upper())
+            elif cmd == "skip":
+                skipped = keymap_advance(self.keymap)
+                if skipped:
+                    log("keymap: %s skipped" % skipped)
+            elif cmd in ("stop", "cancel"):
+                self.keymap["active"] = False
+                self.keymap["message"] = keymap_message(self.keymap)
+                log("keymap: stopped -- %s" % self.keymap["message"])
+            elif cmd == "clear":
+                for name in KEYMAP_ROLES:
+                    self.keys[name] = None
+                    write_config_value(name, "")
+                log("keymap: navigation bindings cleared")
+            elif cmd != "state":
+                raise RuntimeError("unknown keymap command %r" % cmd)
+        return self.keymap_state()
+
+    # -- front panel: knob scrolling -----------------------------------------
+
+    def relay_nav(self, action):
+        """Hand the screen something to do (front-panel keys carry no Qt events)."""
+        with self.nav_lock:
+            self.nav_seq += 1
+            self.nav = {"seq": self.nav_seq, "action": action}
+        return self.nav
+
+    def scroll_device(self):
+        return self.keys.get("scroll_device") or None
+
+    def scroll_invert(self):
+        return bool(self.keys.get("scroll_invert"))
+
+    def scroll_step(self):
+        try:
+            return max(1, int(self.keys.get("scroll_step") or 1))
+        except (TypeError, ValueError):
+            return 1
+
+    def rotary_learning(self):
+        with self.rotary_lock:
+            return bool(self.rotary.get("learning"))
+
+    def record_rotary(self, path, axis, delta):
+        """A learn run saw a knob move: that is the one to scroll with."""
+        with self.rotary_lock:
+            if not self.rotary.get("learning"):
+                return False
+            self.rotary.update({"learning": False, "device": path, "axis": axis,
+                                "delta": delta,
+                                "message": "Knob found: " + path})
+        log("rotary: learnt %s (axis %d)" % (path, axis))
+        return True
+
+    def rotary_state(self):
+        """Learn progress plus what is configured, for the mapping screen."""
+        with self.rotary_lock:
+            state = {"learning": bool(self.rotary.get("learning")),
+                     "learned": self.rotary.get("device"),
+                     "axis": self.rotary.get("axis"),
+                     "message": self.rotary.get("message")}
+        state["device"] = self.scroll_device()
+        state["invert"] = self.scroll_invert()
+        state["step"] = self.scroll_step()
+        state["candidates"] = [name for name, _ in rotary_devices()]
+        return state
+
+    def action_rotary(self, cmd, device=None, invert=None):
+        """Learn, set, invert, or drop the knob used for scrolling."""
+        cmd = (cmd or "state").strip().lower()
+        with self.rotary_lock:
+            if cmd == "learn":
+                self.rotary.update({"learning": True, "device": None, "axis": None,
+                                    "delta": None,
+                                    "message": "Turn the knob you want to scroll with"})
+                log("rotary: waiting for a knob to move")
+            elif cmd == "apply":
+                if not self.rotary.get("device"):
+                    raise RuntimeError("no knob learnt yet")
+                self.keys["scroll_device"] = self.rotary["device"]
+                write_config_value("scroll_device", self.rotary["device"])
+                self.rotary["message"] = "Scrolling with " + self.rotary["device"]
+                log("rotary: scroll_device = %s" % self.rotary["device"])
+            elif cmd == "set":
+                self.keys["scroll_device"] = device or None
+                write_config_value("scroll_device", device or "")
+                self.rotary["message"] = (("Scrolling with " + device) if device
+                                          else "No scroll knob")
+                log("rotary: scroll_device = %s" % (device or "(none)"))
+            elif cmd == "clear":
+                self.keys["scroll_device"] = None
+                write_config_value("scroll_device", "")
+                self.rotary["message"] = "No scroll knob"
+                log("rotary: scroll device cleared")
+            elif cmd == "invert":
+                value = 1 if invert in (True, 1, "1", "on", "true", "yes") else 0
+                self.keys["scroll_invert"] = value
+                write_config_value("scroll_invert", value)
+                log("rotary: scroll_invert = %d" % value)
+            elif cmd != "state":
+                raise RuntimeError("unknown rotary command %r" % cmd)
+        return self.rotary_state()
+
+    def action_local(self, muted):
+        self.local_muted = bool(muted)
+        set_local_mute(self.local_muted)
+        self._save_state()
+        return {"local_muted": self.local_muted}
+
+    def action_volume(self, percent):
+        self.volume = max(0, min(150, int(percent)))
+        self._save_state()
+        sink = self.route_sink or (
+            find_bluetooth_sink(self.route_addr) if self.route_addr else None
+        )
+        if sink:
+            set_sink_volume(sink, self.volume)
+        return {"volume": self.volume}
+
+    def dispatch(self, req):
+        action = (req.get("action") or "").strip()
+        if action == "scan":
+            return self.action_scan(bool(req.get("on", True)))
+        if action == "power":
+            return self.action_power(bool(req.get("on", True)))
+        if action == "pair":
+            return self.action_pair(req["addr"])
+        if action == "connect":
+            return self.action_connect(req["addr"])
+        if action == "disconnect":
+            return self.action_disconnect(req["addr"])
+        if action == "forget":
+            return self.action_forget(req["addr"])
+        if action == "route":
+            return self.action_route(bool(req.get("on", True)), req.get("addr"))
+        if action == "volume":
+            return self.action_volume(req["percent"])
+        if action == "local":
+            return self.action_local(req.get("muted", True))
+        if action == "rotation":
+            return self.action_rotation(req["degrees"])
+        if action == "keymap":
+            return self.action_keymap(req.get("cmd"), req.get("role"),
+                                      req.get("roles"), req.get("seconds"))
+        if action == "rotary":
+            return self.action_rotary(req.get("cmd"), req.get("device"),
+                                      req.get("invert"))
+        if action == "refresh":
+            self.refresh()
+            return {"refreshed": True}
+        raise RuntimeError("unknown action %r" % action)
+
+    # -- state for the UI ----------------------------------------------------
+
+    def route_state(self):
+        return {
+            "enabled": self.route_enabled,
+            "addr": self.route_addr,
+            "sink": self.route_sink,
+            "module": self.route_module,
+            "volume": self.volume,
+            "active": self.route_module is not None,
+            "local_muted": self.local_muted,
+        }
+
+    def snapshot(self):
+        with self.lock:
+            devices = list(self.devices)
+        adapter = self.adapter or {}
+        with _log_lock:
+            loglines = list(_log_lines)[-8:]
+        return {
+            "ok": True,
+            "adapter": {
+                "present": bool(adapter),
+                "address": str(adapter.get("Address", "")),
+                "name": str(adapter.get("Name", "")),
+                "powered": bool(adapter.get("Powered", False)),
+                "discovering": bool(adapter.get("Discovering", False)),
+                "pairable": bool(adapter.get("Pairable", False)),
+            },
+            "source": RADIO_SOURCE,
+            "route": self.route_state(),
+            "devices": devices,
+            "keys": self.keys,
+            "rotation": self.rotation_setting(),
+            "keymap": self.keymap_state(),
+            "rotary": self.rotary_state(),
+            "nav": self.nav,
+            "screen_up": screen_running(),
+            "error": self.last_error,
+            "log": loglines,
+        }
+
+
+# --------------------------------------------------------------------------
+# HTTP API for the QML front-end
+# --------------------------------------------------------------------------
+
+def make_http_handler(daemon):
+    from http.server import BaseHTTPRequestHandler
+
+    class Handler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def _send(self, payload, status=200):
+            body = json.dumps(payload).encode("utf-8")
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, fmt, *args):  # keep the radio's console quiet
+            pass
+
+        def do_GET(self):
+            if self.path.startswith("/state"):
+                self._send(daemon.snapshot())
+            elif self.path in ("/", "/index.html"):
+                self._send({"service": "btaudiod", "api": ["/state", "/cmd"]})
+            else:
+                self._send({"ok": False, "error": "not found"}, 404)
+
+        def do_POST(self):
+            if not self.path.startswith("/cmd"):
+                self._send({"ok": False, "error": "not found"}, 404)
+                return
+            try:
+                length = int(self.headers.get("Content-Length") or 0)
+                req = json.loads(self.rfile.read(length) or b"{}")
+            except (ValueError, TypeError) as exc:
+                self._send({"ok": False, "error": "bad request: %s" % exc}, 400)
+                return
+            try:
+                result = daemon.dispatch(req)
+                result["ok"] = True
+            except KeyError as exc:
+                result = {"ok": False, "error": "missing field %s" % exc}
+            except dbus.DBusException as exc:
+                result = {"ok": False, "error": "%s: %s" % (exc.get_dbus_name(), exc.get_dbus_message())}
+            except Exception as exc:  # noqa: BLE001 - report anything to the UI
+                result = {"ok": False, "error": str(exc)}
+            if not result.get("ok"):
+                daemon.last_error = result.get("error", "error")
+                log("action %s failed: %s" % (req.get("action"), daemon.last_error))
+            self._send(result)
+
+    return Handler
+
+
+def serve_http(daemon):
+    from http.server import ThreadingHTTPServer
+
+    httpd = ThreadingHTTPServer((HTTP_HOST, HTTP_PORT), make_http_handler(daemon))
+    log("HTTP API listening on %s:%d" % (HTTP_HOST, HTTP_PORT))
+    httpd.serve_forever()
+
+
+def poll_loop(daemon, stop):
+    while not stop.is_set():
+        try:
+            daemon.refresh()
+            daemon.sync_route()
+        except Exception as exc:  # noqa: BLE001 - a poll must never kill the daemon
+            log("poll error: %s" % exc)
+        stop.wait(POLL_INTERVAL)
+
+
+def main():
+    stop = threading.Event()
+
+    def shutdown(signum, _frame):
+        log("signal %d, shutting down" % signum)
+        stop.set()
+
+    signal.signal(signal.SIGTERM, shutdown)
+    signal.signal(signal.SIGINT, shutdown)
+
+    try:
+        with open(PID_FILE, "w") as fh:
+            fh.write("%d\n" % os.getpid())
+    except OSError:
+        pass
+
+    daemon = BtAudioDaemon()
+    log("--- btaudiod starting (source=%s) ---" % RADIO_SOURCE)
+
+    # Make sure PulseAudio is willing to handle Bluetooth, even if the stock
+    # default.pa was trimmed.
+    modules = " ".join(pactl("list", "short", "modules"))
+    if "module-bluez5-discover" not in modules:
+        pactl("load-module", "module-bluez5-discover", "headset=native")
+    if "module-bluetooth-policy" not in modules:
+        pactl("load-module", "module-bluetooth-policy", "ag=true", "auto_switch=false")
+
+    daemon.refresh()
+
+    pump = threading.Thread(target=poll_loop, args=(daemon, stop), name="poller")
+    pump.daemon = True
+    pump.start()
+
+    KeyWatch(stop, daemon.keys, daemon).start()
+    RotaryWatch(stop, daemon).start()
+
+    web = threading.Thread(target=serve_http, args=(daemon,), name="http")
+    web.daemon = True
+    web.start()
+
+    while not stop.is_set():
+        stop.wait(0.5)
+
+    # Leave the sound card the way we found it.
+    if daemon.route_module is not None:
+        pactl("unload-module", str(daemon.route_module))
+    try:
+        os.unlink(PID_FILE)
+    except OSError:
+        pass
+    log("--- btaudiod stopped ---")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,36 @@
+#! /bin/sh
+# Start the BT Audio backend at boot.
+#
+# Only the backend daemon is started here; the on-screen app is launched on
+# demand (see /usr/share/support/btaudio).  Running the daemon from boot means a
+# paired headset is bridged again automatically after the radio is power-cycled.
+#
+# Runs after S51bluetooth so BlueZ is already up.
+
+source /etc/profile 2>/dev/null
+
+CTL=/usr/share/support/btaudio
+
+case "$1" in
+  start)
+    printf 'Starting the Bluetooth audio service: '
+    if [ -x "$CTL" ]; then
+        "$CTL" daemon start >/dev/null 2>&1 && echo "OK" || echo "FAILED (see /tmp/btaudio.log)"
+    else
+        echo "SKIPPED ($CTL missing)"
+    fi
+    ;;
+  stop)
+    [ -x "$CTL" ] && "$CTL" daemon stop
+    ;;
+  restart|reload)
+    "$0" stop
+    "$0" start
+    ;;
+  *)
+    echo "Usage: $0 {start|stop|restart}" >&2
+    exit 1
+    ;;
+esac
+
+exit 0
