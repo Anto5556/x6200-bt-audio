@@ -16,6 +16,7 @@ STAGE=/tmp/btaudio-install
 echo "Deploying to $RADIO ..."
 ssh "$RADIO" "rm -rf $STAGE && mkdir -p $STAGE/radio"
 scp -q "$here/install.sh" "$RADIO:$STAGE/install.sh"
+scp -q "$here/README.md" "$RADIO:$STAGE/README.md"
 scp -q "$here/radio/btaudiod" \
        "$here/radio/BtAudio.qml" \
        "$here/radio/Calibrate.qml" \
