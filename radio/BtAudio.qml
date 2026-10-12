@@ -95,7 +95,7 @@ Window {
     property bool navPrimed: false
 
     function focusItems() {
-        var items = ["route", "volume", "speaker", "scan"];
+        var items = ["route", "volume", "speaker", "scan", "remap"];
         var list = devices();
         for (var i = 0; i < list.length; i++)
             items.push("device:" + i);
@@ -144,6 +144,175 @@ Window {
         }
     }
 
+    // ---------------------------------------------------------------------
+    // Front-panel remap (the REMAP entry in the menu)
+    // ---------------------------------------------------------------------
+    // Walks the sequence the backend declares in state.remap.steps: the button
+    // that raises this screen, the knob to scroll with, then the button that
+    // selects.  Each button step arms exactly one role, so the press that
+    // arrives next cannot land on anything else; the knob step reuses the same
+    // learn run `btaudio keymap` uses.  The sequence lives in the backend, so
+    // changing the order is one edit there and no edit here.
+    property bool remapOpen: false
+    property int remapStep: 0
+    property bool remapSeen: false     // backend confirmed the step is armed
+    property bool remapDone: false
+
+    function km() {
+        return (root.state && root.state.keymap) ? root.state.keymap : null;
+    }
+
+    function knob() {
+        return (root.state && root.state.rotary) ? root.state.rotary : null;
+    }
+
+    function remapSteps() {
+        var r = root.state ? root.state.remap : null;
+        if (r && r.steps && r.steps.length > 0)
+            return r.steps;
+        return ["launch", "rotary", "select"];
+    }
+
+    function remapStepName() {
+        var list = root.remapSteps();
+        return (root.remapStep < list.length) ? list[root.remapStep] : null;
+    }
+
+    function remapStepTitle(name) {
+        if (name === "launch")
+            return "Button that opens this screen";
+        if (name === "select")
+            return "Button that selects";
+        if (name === "rotary")
+            return "Knob that scrolls the list";
+        return name;
+    }
+
+    // The keycode that has just arrived for the current step and is waiting to
+    // be confirmed, or null.  This is the readout that makes a mis-press obvious
+    // while it can still be changed -- nothing is written until it is confirmed.
+    function remapPending() {
+        var map = root.km();
+        if (!map || !map.active)
+            return null;
+        var code = map.pending_code;
+        if (code === undefined || code === null)
+            return null;
+        if (map.pending_role !== root.remapStepName())
+            return null;
+        return String(code);
+    }
+
+    function remapStepValue(name) {
+        if (name === "rotary") {
+            var k = root.knob();
+            return (k && k.device) ? k.device : "--";
+        }
+        var map = root.km();
+        var bound = map ? map.bound : null;
+        if (bound && bound[name] !== undefined && bound[name] !== null)
+            return String(bound[name]);
+        return "--";
+    }
+
+    function openRemap() {
+        root.remapOpen = true;
+        root.remapStep = 0;
+        root.remapDone = false;
+        root.remapSeen = false;
+        root.beginRemapStep();
+    }
+
+    function beginRemapStep() {
+        var name = root.remapStepName();
+        root.remapSeen = false;
+        if (name === null) {
+            root.remapDone = true;
+            remapDoneTimer.restart();
+            return;
+        }
+        if (name === "rotary")
+            root.post({ action: "rotary", cmd: "learn" });
+        else
+            root.post({ action: "keymap", cmd: "arm", role: name, seconds: 180 });
+    }
+
+    // Called from the /state poll: the only place that decides a step finished.
+    // Waiting to *see* the step armed before accepting its completion keeps a
+    // stale poll from skipping a step outright.
+    function pumpRemap() {
+        if (!root.remapOpen || root.remapDone || !root.backendUp)
+            return;
+        var name = root.remapStepName();
+        if (name === null)
+            return;
+        if (name === "rotary") {
+            var r = root.knob();
+            if (!r)
+                return;
+            if (!root.remapSeen) {
+                if (r.learning)
+                    root.remapSeen = true;
+                return;
+            }
+            if (r.learned) {
+                root.post({ action: "rotary", cmd: "apply" });
+                root.advanceRemap();
+            }
+            return;
+        }
+        var map = root.km();
+        if (!map)
+            return;
+        if (!root.remapSeen) {
+            if (map.active && map.step_role === name)
+                root.remapSeen = true;
+            return;
+        }
+        if (!map.active)          // the press landed and the role is written
+            root.advanceRemap();
+    }
+
+    function advanceRemap() {
+        root.remapStep += 1;
+        root.beginRemapStep();
+    }
+
+    function restartRemap() {
+        root.post({ action: "keymap", cmd: "cancel" });
+        root.post({ action: "rotary", cmd: "cancel" });
+        remapDoneTimer.stop();
+        root.remapStep = 0;
+        root.remapDone = false;
+        root.beginRemapStep();
+    }
+
+    function skipRemapStep() {
+        var name = root.remapStepName();
+        if (name === null) {
+            root.closeRemap();
+            return;
+        }
+        if (name === "rotary")
+            root.post({ action: "rotary", cmd: "cancel" });
+        else
+            root.post({ action: "keymap", cmd: "skip" });
+        root.advanceRemap();
+    }
+
+    function closeRemap() {
+        // Never leave a step armed: a button pressed after the overlay is gone
+        // would silently become the next binding.
+        root.post({ action: "keymap", cmd: "cancel" });
+        root.post({ action: "rotary", cmd: "cancel" });
+        var saved = root.remapDone;
+        root.remapOpen = false;
+        root.remapDone = false;
+        remapDoneTimer.stop();
+        if (saved)
+            root.flash("Front-panel mapping updated", false);
+    }
+
     function toggleRoute() {
         var target = connectedAudioDevice();
         var on = !!(route() && route().enabled);
@@ -184,6 +353,8 @@ Window {
             root.cmd("local", { muted: !(route() && route().local_muted) });
         } else if (name === "scan") {
             root.toggleScan();
+        } else if (name === "remap") {
+            root.openRemap();
         } else if (name === "close") {
             Qt.quit();
         } else if (name.indexOf("device:") === 0) {
@@ -194,6 +365,13 @@ Window {
     }
 
     function applyNav(action) {
+        // The remap overlay is modal: the front panel is being captured by the
+        // backend, so the only thing a mapped button should still do is leave.
+        if (root.remapOpen) {
+            if (action === "back" || action === "exit")
+                root.closeRemap();
+            return;
+        }
         // While the volume has the knob, arrows and turns change the volume
         // instead of walking the ring away from the control being adjusted.
         if (root.volumeLocked) {
@@ -293,6 +471,7 @@ Window {
                     root.state = JSON.parse(xhr.responseText);
                     root.backendUp = true;
                     root.handleNav(root.state);
+                    root.pumpRemap();
                 } catch (e) {
                     root.backendUp = false;
                 }
@@ -569,7 +748,8 @@ Window {
     Rectangle {
         id: mappingStrip
         z: 10
-        visible: !!(root.state && root.state.keymap && root.state.keymap.active)
+        visible: !root.remapOpen
+                 && !!(root.state && root.state.keymap && root.state.keymap.active)
         anchors { top: header.bottom; left: parent.left; right: parent.right }
         height: 32
         color: "#2b2413"
@@ -588,6 +768,14 @@ Window {
     // ---------------------------------------------------------------------
     // Route card -- the whole point of the app
     // ---------------------------------------------------------------------
+    // The remap result stays up for a moment, then the overlay hands the
+    // screen back -- long enough to read which keycode landed.
+    Timer {
+        id: remapDoneTimer
+        interval: 8000
+        onTriggered: root.closeRemap()
+    }
+
     Rectangle {
         id: routeCard
         anchors { top: header.bottom; left: parent.left; right: parent.right; margins: 10 }
@@ -873,6 +1061,38 @@ Window {
         }
     }
 
+    // Front-panel remap entry: walks the button/knob/button sequence without
+    // leaving the screen (see openRemap).
+    Rectangle {
+        id: remapButton
+        anchors { top: routeCard.bottom; topMargin: 6; right: scanButton.left; rightMargin: 8 }
+        width: 96; height: 26; radius: 13
+        color: root.remapOpen ? theme.warn
+             : (remapHover.containsMouse ? theme.panelHi : theme.panel)
+        border.color: root.focused() === "remap" ? theme.warn : theme.line
+        border.width: root.focused() === "remap" ? 2 : 1
+
+        Text {
+            anchors.centerIn: parent
+            text: "REMAP"
+            color: root.remapOpen ? "#0b0f14" : theme.text
+            font { family: theme.family; pixelSize: 12; bold: true }
+        }
+        MouseArea {
+            id: remapHover
+            anchors.fill: parent
+            hoverEnabled: true
+            onEntered: root.focusOn("remap")
+            onClicked: {
+                root.focusOn("remap");
+                if (root.remapOpen)
+                    root.closeRemap();
+                else
+                    root.openRemap();
+            }
+        }
+    }
+
     ListView {
         id: deviceList
         anchors {
@@ -1117,6 +1337,206 @@ Window {
             text: "SOURCE " + (root.state ? root.state.source : "")
             color: theme.line
             font { family: "DejaVu Sans Mono"; pixelSize: 10 }
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // Remap overlay -- modal, drawn over the whole design stage
+    // ---------------------------------------------------------------------
+    // The front panel is captured by the backend while this is up, so the list
+    // underneath is deliberately unreachable: pressing a button here is how a
+    // binding is made, not how the list is walked.  SKIP / RESTART / CLOSE are
+    // for when a mouse is handy; the mapped back button (or the launch gesture)
+    // also leaves.
+    Item {
+        id: remapOverlay
+        visible: root.remapOpen
+        anchors.fill: parent
+        z: 50
+
+        Rectangle {
+            anchors.fill: parent
+            color: "#000000"
+            opacity: 0.72
+        }
+
+        // Swallow clicks aimed at the list underneath.
+        MouseArea { anchors.fill: parent }
+
+        Rectangle {
+            anchors.centerIn: parent
+            width: 620
+            height: 404
+            radius: 10
+            color: theme.panel
+            border.color: root.remapDone ? theme.good : theme.warn
+            border.width: 2
+
+            Column {
+                anchors { left: parent.left; right: parent.right; top: parent.top; margins: 18 }
+                spacing: 10
+
+                Text {
+                    text: root.remapDone ? "REMAP FRONT PANEL -- DONE"
+                        : (root.remapPending() !== null ? "REMAP FRONT PANEL -- CONFIRM"
+                                                        : "REMAP FRONT PANEL")
+                    color: root.remapPending() !== null ? theme.warn : theme.text
+                    font { family: theme.family; pixelSize: 19; bold: true; letterSpacing: 2 }
+                }
+
+                Text {
+                    width: parent.width
+                    wrapMode: Text.WordWrap
+                    color: root.remapDone ? theme.good : theme.dim
+                    text: {
+                        if (root.remapDone)
+                            return "Saved to /etc/btaudio.conf.  The buttons work straight away.";
+                        if (root.remapPending() !== null)
+                            return "Press that same button again to save it, or a different one "
+                                 + "to change it.  Nothing is written until you do.";
+                        var name = root.remapStepName();
+                        if (name === "rotary")
+                            return "Turn the knob you want to scroll the list with, a few clicks, then stop.";
+                        if (name === "launch")
+                            return "Press the button you want to OPEN and CLOSE this screen with.";
+                        if (name === "select")
+                            return "Press the button you want to SELECT with.";
+                        return "";
+                    }
+                    font { family: theme.family; pixelSize: 14 }
+                }
+
+                // The keycode that just arrived.  Big and amber on purpose: this
+                // is the moment a wrong button is meant to be spotted.
+                Text {
+                    visible: root.remapPending() !== null && !root.remapDone
+                    text: root.remapPending() !== null
+                          ? ("RECEIVED   " + root.remapPending()) : ""
+                    color: theme.warn
+                    font { family: "DejaVu Sans Mono"; pixelSize: 26; bold: true }
+                }
+
+                // The steps, in the order the backend asked for them.
+                Column {
+                    spacing: 6
+                    width: parent.width
+
+                    Repeater {
+                        model: root.remapSteps()
+
+                        Rectangle {
+                            width: parent.width
+                            height: 46
+                            radius: 6
+                            property bool current: root.remapOpen && !root.remapDone
+                                                   && root.remapStep === index
+                            property bool settled: root.remapDone || index < root.remapStep
+                            color: current ? theme.panelHi : theme.bg
+                            border.color: current ? theme.warn
+                                        : (settled ? theme.accentDim : theme.line)
+                            border.width: current ? 2 : 1
+
+                            Text {
+                                anchors { left: parent.left; leftMargin: 12
+                                          verticalCenter: parent.verticalCenter }
+                                text: (index + 1) + ".   " + root.remapStepTitle(modelData)
+                                color: current ? theme.text : theme.dim
+                                font { family: theme.family; pixelSize: 15; bold: current }
+                            }
+
+                            Text {
+                                anchors { right: parent.right; rightMargin: 14
+                                          verticalCenter: parent.verticalCenter }
+                                text: {
+                                    if (parent.current) {
+                                        if (modelData === "rotary") {
+                                            // A knob produces a device, not a
+                                            // keycode, so name the one it found.
+                                            var k = root.knob();
+                                            if (k && k.learned)
+                                                return "found " + k.learned;
+                                            return (k && k.learning) ? "turn it now" : "waiting...";
+                                        }
+                                        var got = root.remapPending();
+                                        return (got !== null) ? (got + "   confirm?") : "press it now";
+                                    }
+                                    return root.remapStepValue(modelData);
+                                }
+                                color: parent.current ? theme.warn : theme.good
+                                font { family: "DejaVu Sans Mono"; pixelSize: 14; bold: true }
+                            }
+                        }
+                    }
+                }
+
+                Row {
+                    spacing: 8
+
+                    Rectangle {
+                        width: 92; height: 34; radius: 6
+                        color: remapSkipHover.containsMouse ? theme.panelHi : theme.bg
+                        border.color: theme.line; border.width: 1
+                        Text {
+                            anchors.centerIn: parent
+                            text: "SKIP"
+                            color: theme.text
+                            font { family: theme.family; pixelSize: 12; bold: true }
+                        }
+                        MouseArea {
+                            id: remapSkipHover
+                            anchors.fill: parent
+                            hoverEnabled: true
+                            onClicked: root.skipRemapStep()
+                        }
+                    }
+
+                    Rectangle {
+                        width: 108; height: 34; radius: 6
+                        color: remapRestartHover.containsMouse ? theme.panelHi : theme.bg
+                        border.color: theme.line; border.width: 1
+                        Text {
+                            anchors.centerIn: parent
+                            text: "RESTART"
+                            color: theme.text
+                            font { family: theme.family; pixelSize: 12; bold: true }
+                        }
+                        MouseArea {
+                            id: remapRestartHover
+                            anchors.fill: parent
+                            hoverEnabled: true
+                            onClicked: root.restartRemap()
+                        }
+                    }
+
+                    Rectangle {
+                        width: 92; height: 34; radius: 6
+                        color: remapCloseHover.containsMouse ? theme.panelHi : theme.bg
+                        border.color: theme.line; border.width: 1
+                        Text {
+                            anchors.centerIn: parent
+                            text: "CLOSE"
+                            color: theme.text
+                            font { family: theme.family; pixelSize: 12; bold: true }
+                        }
+                        MouseArea {
+                            id: remapCloseHover
+                            anchors.fill: parent
+                            hoverEnabled: true
+                            onClicked: root.closeRemap()
+                        }
+                    }
+                }
+
+                Text {
+                    width: parent.width
+                    wrapMode: Text.WordWrap
+                    color: theme.dim
+                    text: "A button is saved on the second press, so a wrong one costs "
+                         + "nothing.  SKIP leaves a step as it was; closing this panel "
+                         + "un-arms whatever was still waiting."
+                    font { family: theme.family; pixelSize: 11 }
+                }
+            }
         }
     }
     }   // </design stage>

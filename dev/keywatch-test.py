@@ -78,6 +78,26 @@ times, what = mod.launch_press_outcome(times, 110.0, 2, 3, True)
 check("presses spread out never close", what, None)
 
 print()
+print("toggle mode (launch_presses=1, exit_presses=1)")
+
+# A single press is the whole gesture in this mode: open while down, close
+# while up, so the one button both raises and dismisses the screen.
+times, what = mod.launch_press_outcome([], 100.0, 1, 1, False)
+check("one press opens", what, "launch")
+check("counter resets after opening", times, [])
+times, what = mod.launch_press_outcome(times, 100.5, 1, 1, True)
+check("the next press closes", what, "exit")
+check("counter resets after closing", times, [])
+
+# The two counts are independent: open on one press, but keep the deliberate
+# three-press exit if that is what the config asks for.
+times, what = mod.launch_press_outcome([], 100.0, 1, 3, True)
+check("launch=1 still needs 3 presses to close", what, None)
+times, what = mod.launch_press_outcome(times, 100.3, 1, 3, True)
+times, what = mod.launch_press_outcome(times, 100.6, 1, 3, True)
+check("the third press closes", what, "exit")
+
+print()
 print("keymap session")
 
 session = {"active": True, "step": 0, "codes": {},
@@ -148,7 +168,214 @@ check("expired session writes nothing", written, [])
 
 live = fake_daemon(mod.time.time() + 60)
 check("armed session accepts the press", mod.BtAudioDaemon.capture_code(live, 715), True)
+check("one press alone writes nothing", written, [])
+check("the press is held as a candidate", live.keymap.get("pending_code"), 715)
+check("for the role being asked for", live.keymap.get("pending_role"), "select")
+check("and the screen is told what arrived",
+      "715" in (live.keymap.get("message") or ""), True)
+
+check("pressing it again commits", mod.BtAudioDaemon.capture_code(live, 715), True)
 check("the binding reaches the config", written, [("select", 715)])
+check("the candidate is let go once it is settled",
+      live.keymap.get("pending_code"), None)
+
+print()
+print("the two-stage capture rule (shown, then confirmed)")
+
+# A first press is only a candidate, so a mis-press costs nothing.
+candidate = {"active": True, "step": 0, "codes": {}, "roles": ["select"],
+             "message": ""}
+check("a first press previews", mod.keymap_preview(candidate, 715), "preview")
+check("and writes nothing", candidate.get("codes"), {})
+
+# The same press again is the confirmation.
+candidate["pending_role"] = "select"
+candidate["pending_code"] = 715
+check("the same press confirms", mod.keymap_preview(candidate, 715), "confirm")
+
+# A different press replaces the candidate instead of committing the wrong one.
+check("a different press previews instead", mod.keymap_preview(candidate, 712),
+      "preview")
+check("previewing alone stores nothing -- capture_code does the storing",
+      (candidate.get("pending_role"), candidate.get("pending_code")),
+      ("select", 715))
+
+check("a finished session previews nothing",
+      mod.keymap_preview({"active": False, "step": 0, "roles": ["select"]}, 715),
+      None)
+check("nor does an idle one", mod.keymap_preview(None, 715), None)
+
+# The same protection as before still applies: the shortcut button is refused
+# unless the step is actually asking to move it.
+check("preview refuses the screen button in a normal walk",
+      mod.keymap_preview({"active": True, "step": 0, "roles": ["up"]}, 724, 724),
+      None)
+check("but allows it when that is the step",
+      mod.keymap_preview({"active": True, "step": 0, "roles": ["launch"]}, 724, 724),
+      "preview")
+
+check("clear_pending lets go of a candidate",
+      mod.clear_pending({"pending_role": "select", "pending_code": 715}), None)
+
+dropped = {"pending_role": "select", "pending_code": 715}
+mod.clear_pending(dropped)
+check("  and the session is empty afterwards", dropped, {})
+
+# SKIP while a candidate is showing must not carry it into the next role, or a
+# button pressed for one step could land on the following one.
+skipping = {"active": True, "step": 0, "codes": {},
+            "roles": ["launch", "select"], "pending_role": "launch",
+            "pending_code": 717, "message": ""}
+check("skipping a step deals with that role", mod.keymap_advance(skipping), "launch")
+check("  and lets go of its candidate",
+      (skipping.get("pending_role"), skipping.get("pending_code")), (None, None))
+check("  and the session moved on", skipping["step"], 1)
+check("  so the next role starts clean",
+      mod.session_step(skipping), "select")
+check("  and the skipped role stays unbound", skipping["codes"], {})
+
+print()
+print("on-screen remap: the step sequence")
+
+check("the plan is button, knob, button",
+      mod.remap_plan(), ["launch", "rotary", "select"])
+check("unrecognised steps are dropped, not left as dead steps",
+      mod.remap_plan(["launch", "nope", "rotary", "select"]),
+      ["launch", "rotary", "select"])
+check("the plan can be reordered from one place",
+      mod.remap_plan(["select", "rotary"]), ["select", "rotary"])
+check("launch is a bindable capture role", "launch" in mod.CAPTURE_ROLES, True)
+check("but the four-role walk still never asks for it",
+      "launch" in mod.KEYMAP_ROLES, False)
+check("session_step reports the role being asked for",
+      mod.session_step({"active": True, "step": 1, "roles": ["launch", "select"]}),
+      "select")
+check("session_step is None once the session is over",
+      mod.session_step({"active": False, "step": 0, "roles": ["launch"]}), None)
+
+print()
+print("on-screen remap: moving the screen button")
+
+# A session that is *asking* for the screen button may capture it -- that is
+# the whole first step of the remap.
+asks_launch = {"active": True, "step": 0, "codes": {}, "roles": ["launch"],
+               "message": ""}
+check("the screen button can be captured when it is asked for",
+      mod.keymap_capture(asks_launch, 724, 724), "launch")
+check("and the press is recorded", asks_launch["codes"].get("launch"), 724)
+
+# ...while a normal four-role walk must still refuse it, or the way in and out
+# of the screen could be captured over by accident.
+walk = {"active": True, "step": 0, "codes": {}, "roles": None, "message": ""}
+check("a normal walk still refuses the screen button",
+      mod.keymap_capture(walk, 724, 724), None)
+check("the refused press does not advance the walk", walk["step"], 0)
+
+screen = fake_daemon(None)
+screen.keys = {"launch": 724, "select": 730}
+screen.keymap = {"active": True, "step": 0, "codes": {}, "roles": ["launch"],
+                 "expires": None, "message": ""}
+written[:] = []
+check("the screen button previews on the first press",
+      mod.BtAudioDaemon.capture_code(screen, 717), True)
+check("and nothing is written yet", written, [])
+check("the screen button moves on the second",
+      mod.BtAudioDaemon.capture_code(screen, 717), True)
+check("and the new keycode is written", written, [("launch", 717)])
+check("and it is live straight away", screen.keys.get("launch"), 717)
+check("bound_codes reports the screen button",
+      mod.BtAudioDaemon.bound_codes(screen).get("launch"), 717)
+check("nav_codes never does, so it cannot be relayed as navigation",
+      mod.BtAudioDaemon.nav_codes(screen).get("launch"), None)
+
+# Moving the screen button onto a key another role already uses must free that
+# role, so one keycode never means two different things.
+swap = fake_daemon(None)
+swap.keys = {"launch": 724, "select": 730}
+swap.keymap = {"active": True, "step": 0, "codes": {}, "roles": ["launch"],
+               "expires": None, "message": ""}
+written[:] = []
+mod.BtAudioDaemon.capture_code(swap, 730)          # preview
+check("moving the screen button onto select's key",
+      mod.BtAudioDaemon.capture_code(swap, 730), True)   # confirm
+check("select is released", swap.keys.get("select"), None)
+check("both changes reach the config", written, [("select", ""), ("launch", 730)])
+
+print()
+print("on-screen remap: cancelling a step")
+
+
+class FakeRotary(object):
+    scroll_device = mod.BtAudioDaemon.scroll_device
+    scroll_invert = mod.BtAudioDaemon.scroll_invert
+    scroll_step = mod.BtAudioDaemon.scroll_step
+    rotary_state = mod.BtAudioDaemon.rotary_state
+
+    def __init__(self):
+        self.keys = {"scroll_device": "/dev/input/event2", "scroll_invert": 1,
+                     "scroll_step": 1}
+        self.rotary_lock = threading.Lock()
+        self.rotary = {"learning": True, "device": "/dev/input/event4",
+                       "axis": 3, "delta": 1, "message": ""}
+
+
+fr = FakeRotary()
+fr_state = mod.BtAudioDaemon.action_rotary(fr, "cancel")
+check("cancel stops the learn run", fr.rotary.get("learning"), False)
+check("cancel drops the knob that was learnt but never applied",
+      fr.rotary.get("device"), None)
+check("cancel leaves the configured knob alone", fr_state.get("device"),
+      "/dev/input/event2")
+
+print()
+print("on-screen remap: the knob step (learn -> apply)")
+
+# A knob may only be picked up while a learn run is actually waiting, or a
+# stray turn of any encoder on the radio would silently become the scroll knob.
+idle = FakeRotary()
+idle.rotary.update({"learning": False, "device": None, "axis": None})
+check("a turn with no learn run is ignored",
+      mod.BtAudioDaemon.record_rotary(idle, "/dev/input/event4", 3, 1), False)
+check("and nothing is remembered", idle.rotary.get("device"), None)
+
+learning = FakeRotary()
+check("a turn during a learn run is picked up",
+      mod.BtAudioDaemon.record_rotary(learning, "/dev/input/event4", 3, 1), True)
+check("the evdev device is remembered", learning.rotary.get("device"),
+      "/dev/input/event4")
+check("and which axis it reports on", learning.rotary.get("axis"), 3)
+check("the learn run stops once a knob answers", learning.rotary.get("learning"),
+      False)
+check("a later turn cannot steal the learnt knob",
+      mod.BtAudioDaemon.record_rotary(learning, "/dev/input/event1", 0, 1), False)
+check("so the first knob stands", learning.rotary.get("device"),
+      "/dev/input/event4")
+
+# apply is what actually commits the learnt knob.
+written[:] = []
+committed = FakeRotary()
+committed.rotary.update({"learning": False, "device": "/dev/input/event4"})
+check("apply reports the learnt knob",
+      mod.BtAudioDaemon.action_rotary(committed, "apply")["device"],
+      "/dev/input/event4")
+check("apply writes it to the config", written,
+      [("scroll_device", "/dev/input/event4")])
+check("and it is live", committed.keys.get("scroll_device"),
+      "/dev/input/event4")
+
+# Applying with nothing learnt must fail loudly rather than quietly unset the
+# knob that is already working.
+empty = FakeRotary()
+empty.rotary.update({"learning": False, "device": None})
+written[:] = []
+try:
+    mod.BtAudioDaemon.action_rotary(empty, "apply")
+    check("apply with nothing learnt is refused", "no error raised", "RuntimeError")
+except RuntimeError:
+    check("apply with nothing learnt is refused", "RuntimeError", "RuntimeError")
+check("and the working knob is left alone", empty.keys.get("scroll_device"),
+      "/dev/input/event2")
+check("with nothing written", written, [])
 
 print()
 print("rotary_steps (knob -> navigation)")

@@ -460,6 +460,27 @@ def launch_press_outcome(press_times, now, launch_needed, exit_needed, screen_up
 #: Front-panel navigation roles, in the order `btaudio keymap` asks for them.
 KEYMAP_ROLES = ("up", "down", "select", "back")
 
+#: Every role a mapping session may bind.  "launch" is the button that raises
+#: and dismisses the screen: it is kept out of KEYMAP_ROLES so the four-role walk
+#: never asks for it by accident, but the on-screen remap can still move it.
+CAPTURE_ROLES = ("launch",) + KEYMAP_ROLES
+
+#: The order the on-screen remap walks through: the button that raises the
+#: screen, the knob to scroll with, and the button that selects.  "rotary" is a
+#: step rather than a role -- the knob is learnt by turning, not by pressing.
+REMAP_STEPS = ("launch", "rotary", "select")
+
+
+def remap_plan(steps=None):
+    """The ordered steps the on-screen remap walks through.
+
+    Kept as data so the sequence can be changed without touching the screen:
+    each step is either a bindable role or "rotary" for the scroll knob, and
+    anything unrecognised is dropped rather than silently becoming a dead step.
+    """
+    return [step for step in (steps or REMAP_STEPS)
+            if step == "rotary" or step in CAPTURE_ROLES]
+
 
 def session_roles(session):
     """The roles a mapping session asks for.
@@ -469,7 +490,7 @@ def session_roles(session):
     walked through the whole set.
     """
     roles = session.get("roles") if session else None
-    chosen = [role for role in (roles or []) if role in KEYMAP_ROLES]
+    chosen = [role for role in (roles or []) if role in CAPTURE_ROLES]
     return chosen or list(KEYMAP_ROLES)
 
 
@@ -506,21 +527,66 @@ def keymap_advance(session, code=None):
     session["step"] = step + 1
     if session["step"] >= len(roles):
         session["active"] = False
+    # The role is settled, so whatever was on the screen as a candidate is not
+    # a candidate any more.
+    clear_pending(session)
     session["message"] = keymap_message(session)
     return role
+
+
+def session_step(session):
+    """The role a running session is currently asking for, or None."""
+    if not session or not session.get("active"):
+        return None
+    roles = session_roles(session)
+    step = int(session.get("step") or 0)
+    return roles[step] if step < len(roles) else None
+
+
+def clear_pending(session):
+    """Drop the candidate binding a session is holding, if it has one."""
+    if not session:
+        return
+    session.pop("pending_role", None)
+    session.pop("pending_code", None)
+
+
+def keymap_preview(session, code, launch_code=None):
+    """Decide what a press means *before* anything is written down.
+
+    Returns "preview" for a press that should be shown as a candidate, "confirm"
+    when it is that same candidate arriving again (so the binding may be
+    committed), or None when the press is not part of a capture at all.  The
+    split is what lets the screen print the keycode that just arrived while the
+    user still has a chance to say no -- a mis-press costs nothing.
+    """
+    if code is None or not session or not session.get("active"):
+        return None
+    role = session_step(session)
+    if role is None:
+        return None
+    if launch_code is not None and code == launch_code and role != "launch":
+        return None
+    code = int(code)
+    if session.get("pending_role") == role and session.get("pending_code") == code:
+        return "confirm"
+    return "preview"
 
 
 def keymap_capture(session, code, launch_code=None):
     """Offer a front-panel press to a running mapping session.
 
     Returns the role the press was bound to, or None for a press that is not
-    part of a capture: no session, a finished one, or the shortcut button, which
-    stays reserved for opening and closing the screen so it can never be
-    captured over by accident.
+    part of a capture: no session, a finished one, or the shortcut button.  That
+    button stays reserved for opening and closing the screen -- but only while
+    it is not the role being asked for, so a session that *does* want to move it
+    (the on-screen remap) can, and a normal button walk still cannot capture it
+    over by accident.
     """
     if code is None or not session or not session.get("active"):
         return None
-    if launch_code is not None and code == launch_code:
+    if launch_code is not None and code == launch_code \
+            and session_step(session) != "launch":
         return None
     return keymap_advance(session, code)
 
@@ -629,8 +695,6 @@ class KeyWatch(threading.Thread):
             log("keywatch: cannot open %s: %s" % (KEYPAD_DEVICE, exc))
             return
 
-        needed = max(1, int(self.keys.get("launch_presses") or 1))
-        exit_needed = max(1, int(self.keys.get("exit_presses") or 3))
         press_times = []
         while not self.stop_event.is_set():
             ready, _, _ = select.select([fh], [], [], 1.0)
@@ -652,7 +716,12 @@ class KeyWatch(threading.Thread):
             if self.daemon_state.capture_code(code):
                 continue
 
-            if code == launch_code:
+            if code == self.keys.get("launch"):
+                # Read live rather than cached when this thread started: the
+                # on-screen remap moves the button, and the button it moved to
+                # has to work immediately, without restarting the daemon.
+                needed = max(1, int(self.keys.get("launch_presses") or 1))
+                exit_needed = max(1, int(self.keys.get("exit_presses") or 3))
                 press_times, what = launch_press_outcome(
                     press_times, now, needed, exit_needed, screen_running(),
                     self.WINDOW)
@@ -686,6 +755,10 @@ class KeyWatch(threading.Thread):
 
     def _exit(self):
         """Ask the screen to close; the launcher puts the stock GUI back."""
+        # Nothing may still be waiting for a button once the screen is gone: a
+        # session left armed turns the next press on the radio into a binding,
+        # out of sight of the screen that asked for it.
+        self.daemon_state.cancel_capture()
         self.daemon_state.relay_nav("exit")
         log("keywatch: closing the BT Audio screen")
 
@@ -1082,6 +1155,19 @@ class BtAudioDaemon(object):
                 out[role] = code
         return out
 
+    def bound_codes(self):
+        """Every capture role currently bound, the screen button included.
+
+        Kept separate from nav_codes so relaying a press to the screen never
+        confuses the button that raises the screen with one that navigates it.
+        """
+        out = {}
+        for role in CAPTURE_ROLES:
+            code = self.keys.get(role)
+            if code is not None:
+                out[role] = code
+        return out
+
     def action_for_code(self, code):
         """Which navigation action a keycode means, or None."""
         for role, bound in self.nav_codes().items():
@@ -1090,7 +1176,13 @@ class BtAudioDaemon(object):
         return None
 
     def capture_code(self, code):
-        """Keywatch hook: let a running mapping session claim a button press."""
+        """Keywatch hook: let a running mapping session claim a button press.
+
+        Two stages, so the screen can show the keycode that just arrived while
+        the user can still change their mind: the first press is only remembered
+        as a candidate, and pressing that same button again commits it.  A wrong
+        button therefore costs nothing but pressing the right one.
+        """
         with self.keymap_lock:
             if self.keymap.get("active") and self.keymap.get("expires") \
                     and time.time() > self.keymap["expires"]:
@@ -1099,13 +1191,27 @@ class BtAudioDaemon(object):
                 self.keymap["active"] = False
                 self.keymap["message"] = "Mapping timed out"
                 log("keymap: session timed out")
+            what = keymap_preview(self.keymap, code, self.keys.get("launch"))
+            if what is None:
+                return False
+            code = int(code)
+            if what == "preview":
+                # Shown, not written: the screen prints this keycode so a wrong
+                # button is obvious before it becomes the binding.
+                role = session_step(self.keymap)
+                self.keymap["pending_role"] = role
+                self.keymap["pending_code"] = code
+                self.keymap["message"] = (
+                    "Received %d for %s -- press the same button again to save"
+                    % (code, role.upper()))
+                log("keymap: %s sees %d -- press it again to save" % (role, code))
+                return True
             role = keymap_capture(self.keymap, code, self.keys.get("launch"))
             if role is None:
                 return False
-            code = int(code)
             # Same button pressed for two roles: the latest one wins, so one
             # keycode never means two different things.
-            for other in KEYMAP_ROLES:
+            for other in CAPTURE_ROLES:
                 if other != role and self.keys.get(other) == code:
                     self.keys[other] = None
                     write_config_value(other, "")
@@ -1114,11 +1220,33 @@ class BtAudioDaemon(object):
             # Written straight away, so a mapping run that is cut short still
             # keeps whatever was captured up to that point.
             write_config_value(role, code)
+            if role == "launch":
+                # The running KeyWatch reads this live, so the new button
+                # raises and dismisses the screen from this press onwards.
+                log("keymap: the screen button is now %d" % code)
             if self.keymap.get("active"):
                 log("keymap: %s = %d" % (role, code))
             else:
                 log("keymap: finished -- %s" % self.keymap.get("message"))
         return True
+
+    def cancel_capture(self):
+        """Drop any half-finished mapping run, button or knob.
+
+        Used when the screen goes away, so an armed step cannot outlive the
+        panel that was asking for it.
+        """
+        with self.keymap_lock:
+            if self.keymap.get("active"):
+                self.keymap["active"] = False
+                clear_pending(self.keymap)
+                self.keymap["message"] = "Mapping cancelled"
+                log("keymap: cancelled with the screen")
+        with self.rotary_lock:
+            if self.rotary.get("learning"):
+                self.rotary.update({"learning": False, "device": None,
+                                    "message": "Knob selection cancelled"})
+                log("rotary: learn cancelled with the screen")
 
     def keymap_state(self):
         """Session plus what is bound, for the mapping screen.
@@ -1128,7 +1256,8 @@ class BtAudioDaemon(object):
         """
         state = dict(self.keymap)
         state["roles"] = session_roles(self.keymap)
-        state["bound"] = self.nav_codes()
+        state["step_role"] = session_step(self.keymap)
+        state["bound"] = self.bound_codes()
         return state
 
     def action_keymap(self, cmd, role=None, roles=None, seconds=None):
@@ -1149,7 +1278,7 @@ class BtAudioDaemon(object):
                 log("keymap: waiting for a button for %s"
                     % session_roles(self.keymap)[0].upper())
             elif cmd == "arm":
-                if role not in KEYMAP_ROLES:
+                if role not in CAPTURE_ROLES:
                     raise RuntimeError("unknown role %r" % role)
                 self.keymap = {"active": True, "step": 0, "codes": {},
                                "roles": [role],
@@ -1163,6 +1292,7 @@ class BtAudioDaemon(object):
                     log("keymap: %s skipped" % skipped)
             elif cmd in ("stop", "cancel"):
                 self.keymap["active"] = False
+                clear_pending(self.keymap)
                 self.keymap["message"] = keymap_message(self.keymap)
                 log("keymap: stopped -- %s" % self.keymap["message"])
             elif cmd == "clear":
@@ -1250,6 +1380,13 @@ class BtAudioDaemon(object):
                 write_config_value("scroll_device", "")
                 self.rotary["message"] = "No scroll knob"
                 log("rotary: scroll device cleared")
+            elif cmd == "cancel":
+                # Give up on a learn run without touching what is configured:
+                # a knob learnt but never applied must not linger either.
+                self.rotary.update({"learning": False, "device": None, "axis": None,
+                                    "delta": None,
+                                    "message": "Knob selection cancelled"})
+                log("rotary: learn cancelled")
             elif cmd == "invert":
                 value = 1 if invert in (True, 1, "1", "on", "true", "yes") else 0
                 self.keys["scroll_invert"] = value
@@ -1344,6 +1481,9 @@ class BtAudioDaemon(object):
             "rotation": self.rotation_setting(),
             "keymap": self.keymap_state(),
             "rotary": self.rotary_state(),
+            # The sequence the on-screen remap walks through.  Sent rather than
+            # hardcoded in the screen so the order is one edit in one place.
+            "remap": {"steps": remap_plan()},
             "nav": self.nav,
             "screen_up": screen_running(),
             "error": self.last_error,

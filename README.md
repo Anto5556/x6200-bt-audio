@@ -122,14 +122,19 @@ Nothing has to be typed in or guessed: the radio can map its own buttons.
 ```
 
 That screen has two phases. First it asks for a button per navigation role
-(`UP`, `DOWN`, `SELECT`, `BACK`) and records the keycode it sees for each, then it
-asks for **the knob to scroll with**: turn it a few clicks and the backend
-reports which of the radio's encoders moved. Press the button you want on the
-radio and each binding is written into `/etc/btaudio.conf` as it goes, so a run
-cut short still keeps what it captured. `SKIP` leaves a role unbound, `RESTART`
-starts over, `CLEAR` drops all four, `FLIP` reverses the knob. The launch button
-is never captured — it stays the way in and out — and the screen closes itself
-when both phases are answered.
+(`UP`, `DOWN`, `SELECT`, `BACK`), then it asks for **the knob to scroll with**:
+turn it a few clicks and the backend reports which of the radio's encoders moved.
+
+Buttons take **two presses**, on purpose: the first press only reports the
+keycode it saw, and the same button pressed again saves it. That is the one
+moment a wrong button is visible while it can still be changed, and it costs
+nothing to get right — press a different button instead and that becomes the
+candidate. Each binding is written into `/etc/btaudio.conf` as it is confirmed,
+so a run cut short still keeps what it captured. `SKIP` leaves a role unbound, `RESTART`
+starts over, `CLEAR` drops all four, `FLIP` reverses the knob. This screen never
+captures the launch button — it stays the way in and out (the in-screen `REMAP`
+below is the one place that may move it) — and the screen closes itself when both
+phases are answered.
 
 Once the knob is bound, that is usually all you need: the knob walks the ring and
 one button selects. The screen the config below describes is exactly that — a
@@ -142,6 +147,19 @@ select=730            # one press acts on whatever the amber ring is on
 scroll_device=/dev/input/event2
 scroll_invert=1       # which way round the knob feels right
 ```
+
+One button raises the screen and the same button dismisses it; only the press
+count differs, so the two settings are independent. Set both to 1 to make it a
+plain toggle — one press in, one press out:
+
+```ini
+launch_presses=1
+exit_presses=1
+```
+
+There is no safe middle ground to guess at, so pick deliberately: with 2 and 3 a
+stray press still does whatever that button normally does on the radio, while
+with 1 and 1 the button is the BT Audio screen and nothing else.
 
 Those keycodes come out of this panel's own matrix keymap, so they differ between
 units and firmwares: a number copied from a table has no way of being right.
@@ -159,6 +177,33 @@ timeout.
 curl -X POST http://127.0.0.1:8637/cmd \
      -d '{"action":"keymap","cmd":"arm","role":"select","seconds":120}'
 ```
+
+**Remapping from the panel itself.** The screen has a `REMAP` entry next to
+`SCAN` for when an SSH terminal is not at hand. It walks three steps in the order
+that matters:
+
+1. **the button that opens this screen** — press the one you want;
+2. **the knob that scrolls the list** — turn it a few clicks;
+3. **the button that selects** — press the one you want.
+
+Button steps confirm on the second press: the panel prints the keycode that just
+arrived (`RECEIVED   717`), the step reads as waiting to be confirmed, and
+the title changes to `CONFIRM`. Nothing is written until you press that same
+button again, so a mis-press is obvious while it can still be changed and costs
+nothing if you press a different one instead. The knob step needs no confirm —
+turning a knob is already unambiguous, and the panel names the encoder it found.
+
+The sequence is data, not layout: the backend publishes it as
+`state.remap.steps` and the screen draws whatever it is handed, so changing the
+order is one edit in `btaudiod` and no edit to the screen. `SKIP` leaves a step
+as it was, `RESTART` begins the three again, and closing the panel un-arms
+whatever step was still waiting — a button pressed afterwards can never silently
+become a binding. Because step 1 moves the launch button, that binding is read
+live: the new button raises the screen from that press onwards, with no daemon
+restart.
+
+The separate `/usr/share/support/btaudio keymap` screen is still there and still
+maps the four navigation roles in a single pass; use whichever suits the moment.
 
 The launch button's press counts are separate, so a single stray press can never
 steal the screen from whatever that button normally does — and the gesture that
@@ -181,6 +226,47 @@ scp dev/keylog.py root@192.168.0.103:/tmp/
 ssh root@192.168.0.103 'python3 /tmp/keylog.py 60'   # then press buttons
 tail -f /tmp/keylog.txt
 ```
+
+Two test scripts check the front panel, neither installed by `install.sh`:
+
+```sh
+scp dev/keywatch-test.py dev/keypad-e2e.py root@192.168.0.103:/tmp/
+ssh root@192.168.0.103 'python3 /tmp/keywatch-test.py'   # the decision rules
+ssh root@192.168.0.103 'python3 /tmp/keypad-e2e.py'      # the real key path
+```
+
+`keywatch-test.py` checks the pure rules — press windows, captures, knob steps —
+with no hardware at all. `keypad-e2e.py` goes further and exercises the whole
+chain: it starts a second, fully isolated `btaudiod` on its own port, feeds key
+presses through a FIFO standing in for the keypad, and asserts that a press is
+captured, lands in the config, and moves the button that raises the screen. It
+uses a throwaway config, state, log and a stub launcher, and never engages the
+audio bridge, so it cannot disturb the radio's real settings or panel.
+
+**Looking at the screen without the radio.** `btaudio snapshot [FILE]` renders the
+real screen offscreen so it can be reviewed without a panel, and
+`dev/render-frames.py` renders the remap overlay too (both states) by driving
+the shipped screen against `dev/mock-backend.py`:
+
+```sh
+scp dev/render-frames.py dev/mock-backend.py root@192.168.0.103:/tmp/
+ssh root@192.168.0.103 'python3 /tmp/render-frames.py'
+scp 'root@192.168.0.103:/tmp/remap-*.png' dev/renders/
+python3 dev/make-render-page.py
+```
+
+**Set the font directory or you will render a screen with no words on it.** Qt on
+this image is built without fontconfig, so it reads fonts *only* from the
+directory named by `QT_QPA_FONTDIR`; its compiled-in fallback, `/usr/lib/fonts`,
+does not exist here. `/etc/profile` sets it (`/etc/profile`, line 45), which is
+why the radio is fine — the launcher and the boot init script both source that
+file. But a plain `ssh root@radio '<command>'` reads no profile, so a render
+launched that way draws every panel, border and colour with no glyphs at all,
+which looks like a broken screen instead of a broken render. `dev/render-frames.py`
+sets the variable and checks the glyphs actually appear before rendering, and
+`btaudio snapshot` goes through the launcher so it is already correct. The one
+other difference to expect: offscreen hands over 800×600 landscape rather than
+the panel's own 480×800, so the design stage appears unrotated.
 
 ## Configuration
 
