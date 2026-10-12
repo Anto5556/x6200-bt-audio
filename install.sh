@@ -36,8 +36,8 @@ case "$1" in
         ;;
 esac
 
-for f in radio/btaudiod radio/BtAudio.qml radio/Calibrate.qml radio/KeyMap.qml \
-         radio/btaudio radio/S52btaudiod radio/btaudio.conf; do
+for f in README.md radio/btaudiod radio/BtAudio.qml radio/Calibrate.qml \
+         radio/KeyMap.qml radio/btaudio radio/S52btaudiod radio/btaudio.conf; do
     if [ ! -f "$HERE/$f" ]; then
         echo "install.sh: missing $HERE/$f" >&2
         exit 1
@@ -53,6 +53,11 @@ cp "$HERE/radio/Calibrate.qml" "$APP_DIR/Calibrate.qml"
 cp "$HERE/radio/KeyMap.qml" "$APP_DIR/KeyMap.qml"
 chmod 0755 "$APP_DIR/btaudiod"
 chmod 0644 "$APP_DIR/BtAudio.qml" "$APP_DIR/Calibrate.qml" "$APP_DIR/KeyMap.qml"
+
+# /etc/btaudio.conf sends the reader here for the front-panel button names, so
+# ship the docs the config refers to.
+cp "$HERE/README.md" "$APP_DIR/README.md"
+chmod 0644 "$APP_DIR/README.md"
 
 cp "$HERE/radio/btaudio" "$CTL"
 chmod 0755 "$CTL"
@@ -75,6 +80,7 @@ echo "  $CTL                   launcher (start|stop|status|snapshot)"
 echo "  $INIT                  starts the backend at boot"
 echo "  $APP_DIR/Calibrate.qml  screen-orientation calibration"
 echo "  $APP_DIR/KeyMap.qml     front-panel button mapping"
+echo "  $APP_DIR/README.md      front-panel keys, config and the API"
 echo "  /etc/btaudio.conf      front-panel key bindings and rotation"
 echo "  /var/lib/btaudio.state routing preference (survives reboots)"
 echo
