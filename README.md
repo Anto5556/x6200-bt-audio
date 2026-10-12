@@ -136,12 +136,18 @@ one button selects. The screen the config below describes is exactly that — a
 knob, one select button, and the launch button.
 
 ```ini
-launch=717            # opened with 2 quick presses, closed with 3
+launch=724            # opened with 2 quick presses, closed with 3
 exit_presses=3
-select=704            # one press acts on whatever the amber ring is on
+select=730            # one press acts on whatever the amber ring is on
 scroll_device=/dev/input/event2
 scroll_invert=1       # which way round the knob feels right
 ```
+
+Those keycodes come out of this panel's own matrix keymap, so they differ between
+units and firmwares: a number copied from a table has no way of being right.
+Press the button instead — the capture writes the code into the file for you, and
+`dev/keylog.py` prints every code the panel sends (it is a dev aid, not installed
+by `install.sh`, so `scp dev/keylog.py root@<radio>:/tmp/` first).
 
 **Moving a single button** (no need to walk the whole set again): arm the capture
 from the radio's own terminal, then press the button once. The screen shows an
@@ -165,6 +171,15 @@ To see what the keypad is sending at any time:
 
 ```sh
 tail -f /tmp/btaudio.log      # "keywatch:" presses, "keymap:" captures
+```
+
+That log only shows presses that are bound or being captured. For the raw stream
+of every code the panel sends, bound or not:
+
+```sh
+scp dev/keylog.py root@192.168.0.103:/tmp/
+ssh root@192.168.0.103 'python3 /tmp/keylog.py 60'   # then press buttons
+tail -f /tmp/keylog.txt
 ```
 
 ## Configuration
@@ -249,6 +264,7 @@ curl -X POST http://127.0.0.1:8637/cmd -d '{"action":"rotary","cmd":"invert","in
 | Knob does not scroll        | `scroll_device` in `/etc/btaudio.conf`; re-run `btaudio keymap` and do the knob phase again, or `{"action":"rotary","cmd":"learn"}`. If it scrolls the wrong way, `scroll_invert`. |
 | MAPPING strip will not go   | An armed capture was left open: post `{"action":"keymap","cmd":"cancel"}`, or wait out its timeout. |
 | Ring stuck on the volume    | That is the volume lock: select again to release it, or select any other control. |
+| A binding landed on the wrong button | Arm a single capture and press the button you actually want; `dev/keylog.py` shows the raw code each key sends. |
 
 The captures in `dev/renders/` are real frames from the radio, produced with
 `btaudio snapshot`.
