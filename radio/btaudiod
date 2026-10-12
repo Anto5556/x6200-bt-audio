@@ -95,22 +95,30 @@ EVI = struct.Struct("<IIHHi")  # struct input_event on 32-bit ARM
 STRING_KEYS = ("scroll_device",)
 
 DEFAULT_KEYS = {
-    "launch": None,        # keycode that opens the screen (pressed twice)
+    # Built-in bindings, in force whenever /etc/btaudio.conf does not override
+    # them.  These are the values this radio is used with, so a fresh install
+    # (or a config that has lost its bindings) still comes up navigable instead
+    # of leaving the panel able only to raise and dismiss the screen.  Nothing
+    # here is fixed: the screen's own REMAP entry changes any of it, and so does
+    # `btaudio keymap` -- both write the new value into /etc/btaudio.conf, which
+    # wins over these defaults.
+    "launch": 724,        # keycode that opens the screen (pressed twice)
     "launch_presses": 2,   # how many presses within 2s count as the shortcut
     "exit_presses": 3,     # ...and how many close it again while it is up
-    # On-screen navigation.  `btaudio keymap` fills these in: it asks for a
+    # On-screen navigation.  `btaudio keymap` can fill these in: it asks for a
     # button per role and the daemon reads the keypad itself, so nothing here
-    # depends on what Qt does with the keymap's vendor keycodes.
+    # depends on what Qt does with the keymap's vendor keycodes.  Leave a role
+    # empty in the config to unbind it.
     "up": None,
     "down": None,
-    "select": None,
-    "back": None,
+    "select": 730,
+    "back": 714,
     # Scrolling with a rotary encoder instead of (or as well as) the buttons:
     # the evdev device to read, which way round it feels right, and how many
     # reported units make one step.  `btaudio keymap` learns the device -- turn
     # the knob when the screen asks and the path is written here.
-    "scroll_device": None,
-    "scroll_invert": 0,
+    "scroll_device": "/dev/input/event4",
+    "scroll_invert": 1,
     "scroll_step": 1,
     # How far the 800x480 UI is rotated inside the frame Qt hands it.  "auto"
     # (the normal setting) is decided by the shape of that frame: 270 for the

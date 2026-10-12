@@ -144,9 +144,15 @@ knob, one select button, and the launch button.
 launch=724            # opened with 2 quick presses, closed with 3
 exit_presses=3
 select=730            # one press acts on whatever the amber ring is on
-scroll_device=/dev/input/event2
+scroll_device=/dev/input/event4
 scroll_invert=1       # which way round the knob feels right
 ```
+
+These values are the **built-in defaults** (`DEFAULT_KEYS` in `btaudiod`), so the
+panel still navigates on a fresh install or after a config that has lost its
+bindings — it is never reduced to a button that can only raise and dismiss the
+screen. `/etc/btaudio.conf` overrides them, and the in-screen `REMAP` entry (or
+`btaudio keymap`) changes any of them without editing a file by hand.
 
 One button raises the screen and the same button dismisses it; only the press
 count differs, so the two settings are independent. Set both to 1 to make it a

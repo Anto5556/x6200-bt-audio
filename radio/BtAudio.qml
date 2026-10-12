@@ -471,15 +471,38 @@ Window {
                     root.state = JSON.parse(xhr.responseText);
                     root.backendUp = true;
                     root.handleNav(root.state);
-                    root.pumpRemap();
                 } catch (e) {
                     root.backendUp = false;
+                }
+                // Kept out of the block above on purpose: a fault in the remap
+                // overlay must never mark the backend down and so freeze the
+                // whole screen's navigation.
+                try {
+                    root.pumpRemap();
+                } catch (e) {
+                    console.log("remap error: " + e);
                 }
             } else {
                 root.backendUp = false;
             }
         };
         xhr.send();
+    }
+
+    // POST a fully-formed command body.  The remap helpers below build one
+    // object (action plus its fields) and hand it over whole, so they need this
+    // rather than cmd(), which takes the action separately.  Without it those
+    // calls throw a TypeError, which used to leave the modal REMAP overlay open
+    // and swallow every front-panel press.
+    function post(body) {
+        var xhr = new XMLHttpRequest();
+        xhr.open("POST", root.api + "/cmd");
+        xhr.setRequestHeader("Content-Type", "application/json");
+        xhr.onreadystatechange = function () {
+            if (xhr.readyState === 4)
+                root.fetchState();
+        };
+        xhr.send(JSON.stringify(body));
     }
 
     function cmd(action, params) {
